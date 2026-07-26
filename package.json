@@ -1,0 +1,34 @@
+{
+  "name": "bazel-gha-remote-cache",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "A loopback Bazel remote-cache adapter backed by GitHub Actions Cache v2",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "npm run format:check && npm run typecheck && npm test && npm run build && npm run notices:check && npm run test:dist",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "notices:check": "node scripts/third-party-notices.mjs --check",
+    "notices:generate": "node scripts/third-party-notices.mjs --write",
+    "test": "tsx --test test/**/*.test.ts",
+    "test:dist": "node scripts/test-dist.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@actions/core": "3.0.1",
+    "@azure/storage-blob": "12.31.0",
+    "@protobuf-ts/runtime": "2.11.1",
+    "@protobuf-ts/runtime-rpc": "2.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.1.0",
+    "esbuild": "0.25.8",
+    "prettier": "3.6.2",
+    "tsx": "4.20.3",
+    "typescript": "5.9.2"
+  }
+}

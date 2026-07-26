@@ -1,0 +1,138 @@
+name: Cache v2 canary
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-v2-canary
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Upload raw CAS object
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      finalized_at: ${{ steps.put.outputs.finalized_at }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Start writable cache adapter
+        id: cache
+        uses: ./
+        with:
+          namespace: canary-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          mode: read-write
+          max-object-size: '1048576'
+          max-inflight-bytes: '1048576'
+          upload-concurrency: '1'
+          download-concurrency: '1'
+          fail-job-on-cache-error: 'true'
+
+      - name: Upload raw bytes
+        id: put
+        shell: bash
+        env:
+          CACHE_URL: ${{ steps.cache.outputs.url }}
+          CACHE_READABLE: ${{ steps.cache.outputs.readable }}
+          CACHE_WRITABLE: ${{ steps.cache.outputs.writable }}
+        run: |
+          set -euo pipefail
+
+          test "$CACHE_READABLE" = true
+          test "$CACHE_WRITABLE" = true
+
+          payload="$RUNNER_TEMP/cache-v2-canary.bin"
+          printf 'bazel-gha-remote-cache canary\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$payload"
+          digest="$(sha256sum "$payload" | cut -d ' ' -f 1)"
+
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --max-time 60 \
+            --request PUT \
+            --header 'Content-Type: application/octet-stream' \
+            --data-binary "@$payload" \
+            "${CACHE_URL%/}/cas/$digest"
+
+          echo "finalized_at=$(date -u +%s)" >>"$GITHUB_OUTPUT"
+
+  download:
+    name: Download raw CAS object
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Start read-only cache adapter
+        id: cache
+        uses: ./
+        with:
+          namespace: canary-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          mode: read-only
+          max-object-size: '1048576'
+          max-inflight-bytes: '1048576'
+          upload-concurrency: '1'
+          download-concurrency: '1'
+          fail-job-on-cache-error: 'true'
+
+      - name: Download and verify raw bytes
+        shell: bash
+        env:
+          CACHE_URL: ${{ steps.cache.outputs.url }}
+          CACHE_READABLE: ${{ steps.cache.outputs.readable }}
+          CACHE_WRITABLE: ${{ steps.cache.outputs.writable }}
+          FINALIZED_AT: ${{ needs.upload.outputs.finalized_at }}
+        run: |
+          set -euo pipefail
+
+          test "$CACHE_READABLE" = true
+          test "$CACHE_WRITABLE" = false
+          [[ "$FINALIZED_AT" =~ ^[0-9]+$ ]]
+
+          expected="$RUNNER_TEMP/cache-v2-canary.expected"
+          actual="$RUNNER_TEMP/cache-v2-canary.actual"
+          printf 'bazel-gha-remote-cache canary\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$expected"
+          digest="$(sha256sum "$expected" | cut -d ' ' -f 1)"
+
+          for attempt in {1..12}; do
+            if curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 60 \
+              --output "$actual" \
+              "${CACHE_URL%/}/cas/$digest"; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 12 ]]; then
+              echo 'The finalized Cache v2 object was not visible after 12 attempts.' >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          cmp --silent "$expected" "$actual"
+
+          verified_at="$(date -u +%s)"
+          latency_seconds="$((verified_at - FINALIZED_AT))"
+          {
+            echo '### Cache v2 cross-job canary'
+            echo
+            echo "Verified the exact raw CAS bytes ${latency_seconds}s after finalization."
+          } >>"$GITHUB_STEP_SUMMARY"

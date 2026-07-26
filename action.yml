@@ -1,0 +1,52 @@
+name: Bazel remote cache backed by GitHub Actions Cache v2
+description: Starts a loopback Bazel HTTP remote-cache adapter
+author: bazel-gha-remote-cache contributors
+
+inputs:
+  namespace:
+    description: Logical cache namespace and schema generation
+    default: bazel-v1
+  mode:
+    description: auto, read-only, or read-write
+    default: auto
+  port:
+    description: Loopback port; 0 selects an available port
+    default: '0'
+  max-object-size:
+    description: Maximum Bazel object size in bytes
+    default: '2147483648'
+  max-inflight-bytes:
+    description: Maximum bytes simultaneously being spooled
+    default: '4294967296'
+  upload-concurrency:
+    description: Maximum number of concurrent object uploads
+    default: '4'
+  download-concurrency:
+    description: Maximum number of concurrent object downloads
+    default: '16'
+  remote-timeout-seconds:
+    description: Bazel and cache-service request timeout
+    default: '30'
+  fail-job-on-cache-error:
+    description: Fail the post step when the adapter observed a backend error
+    default: 'false'
+
+outputs:
+  url:
+    description: Loopback remote-cache URL
+  writable:
+    description: Whether the daemon accepts writes
+  readable:
+    description: Whether the daemon performs reads
+  bazelrc:
+    description: Generated Bazel rc file
+
+runs:
+  using: node24
+  main: dist/main.js
+  post: dist/post.js
+  post-if: always()
+
+branding:
+  icon: database
+  color: green
