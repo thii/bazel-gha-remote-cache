@@ -21,6 +21,14 @@ function stringField(value: Record<string, unknown>, name: string): string {
   return field
 }
 
+function optionalStringField(
+  value: Record<string, unknown>,
+  name: string
+): string | undefined {
+  if (value[name] === undefined) return undefined
+  return stringField(value, name)
+}
+
 function booleanField(value: Record<string, unknown>, name: string): boolean {
   const field = value[name]
   if (typeof field !== 'boolean') {
@@ -65,6 +73,26 @@ export function validateDaemonConfig(value: unknown): DaemonConfig {
     maxObjectSize,
     Number.MAX_SAFE_INTEGER
   )
+  const maxPendingBytes = integerField(
+    data,
+    'maxPendingBytes',
+    maxObjectSize,
+    Number.MAX_SAFE_INTEGER
+  )
+  const storageMode = stringField(data, 'storageMode')
+  if (storageMode !== 'object' && storageMode !== 'pack') {
+    throw new Error('control data has an invalid storageMode')
+  }
+  const writeBack = booleanField(data, 'writeBack')
+  if (storageMode === 'pack' && !writeBack) {
+    throw new Error('packed storage requires write-back')
+  }
+  const packTargetBytes = integerField(
+    data,
+    'packTargetBytes',
+    1,
+    maxPendingBytes
+  )
   const controlDirectory = stringField(data, 'controlDirectory')
   if (!path.isAbsolute(controlDirectory)) {
     throw new Error('control directory must be absolute')
@@ -77,18 +105,77 @@ export function validateDaemonConfig(value: unknown): DaemonConfig {
   if (!/^[0-9a-f-]{36}$/.test(instanceId)) {
     throw new Error('control data has an invalid instance ID')
   }
+  const githubApiUrl = stringField(data, 'githubApiUrl')
+  let parsedApiUrl: URL
+  try {
+    parsedApiUrl = new URL(githubApiUrl)
+  } catch {
+    throw new Error('control data has an invalid GitHub API URL')
+  }
+  if (
+    parsedApiUrl.protocol !== 'https:' ||
+    parsedApiUrl.username !== '' ||
+    parsedApiUrl.password !== ''
+  ) {
+    throw new Error('control data has an invalid GitHub API URL')
+  }
+  const githubRepository = stringField(data, 'githubRepository')
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubRepository)) {
+    throw new Error('control data has an invalid GitHub repository')
+  }
+  const currentRef = stringField(data, 'currentRef')
+  const baseRef = optionalStringField(data, 'baseRef')
+  const defaultRef = stringField(data, 'defaultRef')
+  if (
+    !currentRef.startsWith('refs/') ||
+    (baseRef !== undefined && !baseRef.startsWith('refs/heads/')) ||
+    !defaultRef.startsWith('refs/')
+  ) {
+    throw new Error('control data has an invalid Git ref')
+  }
+  const runId = stringField(data, 'runId')
+  if (!/^(0|[1-9][0-9]{0,19})$/.test(runId)) {
+    throw new Error('control data has an invalid run ID')
+  }
+  const jobHash = stringField(data, 'jobHash')
+  if (!/^[0-9a-f]{16,64}$/.test(jobHash)) {
+    throw new Error('control data has an invalid job hash')
+  }
 
   return {
     namespace,
+    storageMode,
     port: integerField(data, 'port', 0, 65535),
     readable: booleanField(data, 'readable'),
     writable: booleanField(data, 'writable'),
     maxObjectSize,
     maxInflightBytes,
+    maxPendingBytes,
     uploadConcurrency: integerField(data, 'uploadConcurrency', 1, 128),
     downloadConcurrency: integerField(data, 'downloadConcurrency', 1, 256),
+    repositoryUploadBudget: integerField(
+      data,
+      'repositoryUploadBudget',
+      1,
+      200
+    ),
+    expectedWriters: integerField(data, 'expectedWriters', 1, 256),
+    uploadBurst: integerField(data, 'uploadBurst', 1, 200),
+    writeBack,
+    flushTimeoutSeconds: integerField(data, 'flushTimeoutSeconds', 1, 3600),
+    packTargetBytes,
+    packMaxObjects: integerField(data, 'packMaxObjects', 1, 256),
+    packMaxAgeSeconds: integerField(data, 'packMaxAgeSeconds', 1, 300),
+    catalogRefreshSeconds: integerField(data, 'catalogRefreshSeconds', 1, 3600),
     remoteTimeoutSeconds: integerField(data, 'remoteTimeoutSeconds', 1, 3600),
     failJobOnCacheError: booleanField(data, 'failJobOnCacheError'),
+    githubApiUrl,
+    githubRepository,
+    currentRef,
+    ...(baseRef === undefined ? {} : {baseRef}),
+    defaultRef,
+    runId,
+    jobHash,
     controlDirectory,
     shutdownToken,
     instanceId
@@ -123,7 +210,7 @@ export function validateDaemonReady(value: unknown): DaemonReady {
 
 export function validateMetrics(value: unknown): MetricsSnapshot {
   const data = record(value)
-  if (data['schemaVersion'] !== 1) throw new Error('unknown metrics schema')
+  if (data['schemaVersion'] !== 2) throw new Error('unknown metrics schema')
 
   const timestamp = (source: Record<string, unknown>, name: string): string => {
     const result = stringField(source, name)
@@ -134,6 +221,30 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
   }
   const counter = (source: Record<string, unknown>, name: string): number =>
     integerField(source, name, 0, Number.MAX_SAFE_INTEGER)
+  const decimal = (source: Record<string, unknown>, name: string): number => {
+    const value = source[name]
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new Error(`control data has an invalid ${name}`)
+    }
+    return value
+  }
+  const objectIdentities = (source: unknown): string[] => {
+    if (
+      !Array.isArray(source) ||
+      source.length > 100 ||
+      source.some(
+        value =>
+          typeof value !== 'string' || !/^(ac|cas):[0-9a-f]{64}$/.test(value)
+      )
+    ) {
+      throw new Error('control data has invalid remaining object identities')
+    }
+    const identities = [...source]
+    if (new Set(identities).size !== identities.length) {
+      throw new Error('control data has duplicate remaining object identities')
+    }
+    return identities
+  }
   const kindCounters = (source: unknown): KindCounters => {
     const counters = record(source)
     return {
@@ -151,7 +262,15 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
   const reads = record(data['reads'])
   const writes = record(data['writes'])
   const backend = record(data['backend'])
+  const rateLimits = record(data['rateLimits'])
+  const writeBack = record(data['writeBack'])
+  const catalog = record(data['catalog'])
   const stoppedAt = data['stoppedAt']
+  const remainingObjects = counter(writeBack, 'remainingObjects')
+  const remainingObjectIds = objectIdentities(writeBack['remainingObjectIds'])
+  if (remainingObjectIds.length > remainingObjects) {
+    throw new Error('control data has too many remaining object identities')
+  }
   if (
     stoppedAt !== undefined &&
     (typeof stoppedAt !== 'string' || !Number.isFinite(Date.parse(stoppedAt)))
@@ -160,7 +279,7 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
   }
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     startedAt: timestamp(data, 'startedAt'),
     ...(stoppedAt === undefined ? {} : {stoppedAt}),
     readable: booleanField(data, 'readable'),
@@ -189,6 +308,38 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
       errors: counter(backend, 'errors'),
       rateLimited: counter(backend, 'rateLimited')
     },
+    rateLimits: {
+      reserve: counter(rateLimits, 'reserve'),
+      upload: counter(rateLimits, 'upload'),
+      finalize: counter(rateLimits, 'finalize'),
+      lookup: counter(rateLimits, 'lookup'),
+      download: counter(rateLimits, 'download')
+    },
+    writeBack: {
+      acceptedObjects: counter(writeBack, 'acceptedObjects'),
+      deduplicatedObjects: counter(writeBack, 'deduplicatedObjects'),
+      packedObjects: counter(writeBack, 'packedObjects'),
+      packsFinalized: counter(writeBack, 'packsFinalized'),
+      packBytes: counter(writeBack, 'packBytes'),
+      pendingObjects: counter(writeBack, 'pendingObjects'),
+      pendingBytes: counter(writeBack, 'pendingBytes'),
+      peakPendingBytes: counter(writeBack, 'peakPendingBytes'),
+      remainingObjects,
+      remainingObjectIds,
+      acBlockedByBarrier: counter(writeBack, 'acBlockedByBarrier'),
+      reservationSleepMs: counter(writeBack, 'reservationSleepMs'),
+      configuredEntriesPerMinute: decimal(
+        writeBack,
+        'configuredEntriesPerMinute'
+      ),
+      currentEntriesPerMinute: decimal(writeBack, 'currentEntriesPerMinute')
+    },
+    catalog: {
+      refreshes: counter(catalog, 'refreshes'),
+      bloomCandidates: counter(catalog, 'bloomCandidates'),
+      bloomFalsePositives: counter(catalog, 'bloomFalsePositives'),
+      rangeBytesDownloaded: counter(catalog, 'rangeBytesDownloaded')
+    },
     integrityFailures: counter(data, 'integrityFailures'),
     casWriteFailed: booleanField(data, 'casWriteFailed'),
     writeCircuitOpen: booleanField(data, 'writeCircuitOpen'),
@@ -202,6 +353,7 @@ export function metricsHaveCacheErrors(stats: MetricsSnapshot): boolean {
   return (
     stats.stoppedAt === undefined ||
     stats.backend.errors > 0 ||
+    stats.backend.rateLimited > 0 ||
     stats.integrityFailures > 0 ||
     stats.casWriteFailed ||
     stats.readCircuitOpen ||
@@ -209,7 +361,8 @@ export function metricsHaveCacheErrors(stats: MetricsSnapshot): boolean {
     stats.reads.ac.errors > 0 ||
     stats.reads.cas.errors > 0 ||
     stats.writes.ac.errors > 0 ||
-    stats.writes.cas.errors > 0
+    stats.writes.cas.errors > 0 ||
+    stats.writeBack.remainingObjects > 0
   )
 }
 

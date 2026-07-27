@@ -6,18 +6,37 @@ export const CONTROL_DIRECTORY_PREFIX = 'bazel-gha-cache-'
 
 export type CacheKind = 'ac' | 'cas'
 export type RequestedMode = 'auto' | 'read-only' | 'read-write'
+export type StorageMode = 'object' | 'pack'
 
 export interface DaemonConfig {
   namespace: string
+  storageMode: StorageMode
   port: number
   readable: boolean
   writable: boolean
   maxObjectSize: number
   maxInflightBytes: number
+  maxPendingBytes: number
   uploadConcurrency: number
   downloadConcurrency: number
+  repositoryUploadBudget: number
+  expectedWriters: number
+  uploadBurst: number
+  writeBack: boolean
+  flushTimeoutSeconds: number
+  packTargetBytes: number
+  packMaxObjects: number
+  packMaxAgeSeconds: number
+  catalogRefreshSeconds: number
   remoteTimeoutSeconds: number
   failJobOnCacheError: boolean
+  githubApiUrl: string
+  githubRepository: string
+  currentRef: string
+  baseRef?: string
+  defaultRef: string
+  runId: string
+  jobHash: string
   controlDirectory: string
   shutdownToken: string
   instanceId: string
@@ -44,7 +63,7 @@ export interface KindCounters {
 }
 
 export interface MetricsSnapshot {
-  schemaVersion: 1
+  schemaVersion: 2
   startedAt: string
   stoppedAt?: string
   readable: boolean
@@ -67,6 +86,35 @@ export interface MetricsSnapshot {
     errors: number
     rateLimited: number
   }
+  rateLimits: {
+    reserve: number
+    upload: number
+    finalize: number
+    lookup: number
+    download: number
+  }
+  writeBack: {
+    acceptedObjects: number
+    deduplicatedObjects: number
+    packedObjects: number
+    packsFinalized: number
+    packBytes: number
+    pendingObjects: number
+    pendingBytes: number
+    peakPendingBytes: number
+    remainingObjects: number
+    remainingObjectIds: string[]
+    acBlockedByBarrier: number
+    reservationSleepMs: number
+    configuredEntriesPerMinute: number
+    currentEntriesPerMinute: number
+  }
+  catalog: {
+    refreshes: number
+    bloomCandidates: number
+    bloomFalsePositives: number
+    rangeBytesDownloaded: number
+  }
   integrityFailures: number
   casWriteFailed: boolean
   writeCircuitOpen: boolean
@@ -78,6 +126,7 @@ export interface MetricsSnapshot {
 export interface EventContext {
   eventName: string
   ref: string
+  baseBranch?: string
   defaultBranch?: string
   refProtected: boolean
 }

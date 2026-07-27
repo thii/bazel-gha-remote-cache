@@ -18,6 +18,8 @@ import {
 } from './lifecycle.js'
 import type {DaemonConfig, DaemonReady, MetricsSnapshot} from './model.js'
 
+const SHUTDOWN_BUFFER_MS = 15_000
+
 function statePid(raw: string): number | undefined {
   if (!/^[1-9][0-9]*$/.test(raw)) return undefined
   const value = Number(raw)
@@ -77,11 +79,18 @@ async function stopDaemon(
 ): Promise<boolean> {
   if (!processIsRunning(pid)) return true
   if (!(await daemonIdentityMatches(ready))) return false
+  const drainDeadlineMs = config.flushTimeoutSeconds * 1000
+  const gracefulTimeoutMs = drainDeadlineMs + SHUTDOWN_BUFFER_MS
+  const gracefulDeadline = Date.now() + gracefulTimeoutMs
   try {
     const response = await fetch(`${ready.url}/shutdown`, {
       method: 'POST',
-      headers: {Authorization: `Bearer ${config.shutdownToken}`},
-      signal: AbortSignal.timeout(5000)
+      headers: {
+        Authorization: `Bearer ${config.shutdownToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({drain: true, deadlineMs: drainDeadlineMs}),
+      signal: AbortSignal.timeout(Math.min(10_000, gracefulTimeoutMs))
     })
     if (response.status !== 202 && response.status !== 503) {
       core.warning(
@@ -92,8 +101,13 @@ async function stopDaemon(
     core.warning('Cache daemon did not respond to graceful shutdown.')
   }
 
-  if (await waitForExit(pid, 15_000)) return true
-  if (!(await daemonIdentityMatches(ready))) return false
+  // The daemon closes its listener before draining the write-back queue. Do
+  // not send SIGTERM while that bounded drain can still be making progress.
+  if (await waitForExit(pid, Math.max(0, gracefulDeadline - Date.now()))) {
+    return true
+  }
+  // Identity was verified immediately before the authenticated shutdown
+  // request, and waitForExit polls often enough to observe an intervening exit.
   return terminateKnownProcess(pid)
 }
 
@@ -112,6 +126,34 @@ async function addSummary(stats: MetricsSnapshot): Promise<void> {
     String(stats.writes[kind].errors),
     String(stats.writes[kind].bytes)
   ])
+
+  const elapsedMinutes = Math.max(
+    1 / 60,
+    ((stats.stoppedAt ? Date.parse(stats.stoppedAt) : Date.now()) -
+      Date.parse(stats.startedAt)) /
+      60_000
+  )
+  const reservationRate = stats.backend.reservations / elapsedMinutes
+  const lookupRate = stats.backend.lookups / elapsedMinutes
+  const rateLimitOperations =
+    stats.rateLimits.reserve +
+    stats.rateLimits.upload +
+    stats.rateLimits.finalize +
+    stats.rateLimits.lookup +
+    stats.rateLimits.download
+  const rateLimitCount = Math.max(
+    stats.backend.rateLimited,
+    rateLimitOperations
+  )
+  const sawRateLimit = rateLimitCount > 0
+  const averageObjectsPerPack =
+    stats.writeBack.packsFinalized === 0
+      ? 0
+      : stats.writeBack.packedObjects / stats.writeBack.packsFinalized
+  const averageBytesPerPack =
+    stats.writeBack.packsFinalized === 0
+      ? 0
+      : stats.writeBack.packBytes / stats.writeBack.packsFinalized
 
   core.summary
     .addHeading('Bazel Actions Cache adapter', 3)
@@ -135,23 +177,98 @@ async function addSummary(stats: MetricsSnapshot): Promise<void> {
       ],
       ...writeRows
     ])
+    .addTable([
+      [
+        {data: 'Write-back and packs', header: true},
+        {data: 'Value', header: true}
+      ],
+      ['Bazel objects accepted', String(stats.writeBack.acceptedObjects)],
+      [
+        'Objects deduplicated locally',
+        String(stats.writeBack.deduplicatedObjects)
+      ],
+      ['Objects written into packs', String(stats.writeBack.packedObjects)],
+      ['Packs finalized', String(stats.writeBack.packsFinalized)],
+      ['Average objects per pack', averageObjectsPerPack.toFixed(1)],
+      ['Average bytes per pack', averageBytesPerPack.toFixed(1)],
+      ['Pending objects', String(stats.writeBack.pendingObjects)],
+      ['Pending bytes', String(stats.writeBack.pendingBytes)],
+      ['Peak pending bytes', String(stats.writeBack.peakPendingBytes)],
+      [
+        'Objects remaining at shutdown',
+        String(stats.writeBack.remainingObjects)
+      ],
+      [
+        'AC records blocked by CAS barriers',
+        String(stats.writeBack.acBlockedByBarrier)
+      ]
+    ])
+    .addTable([
+      [
+        {data: 'Rate limiting', header: true},
+        {data: 'Value', header: true}
+      ],
+      [
+        'Configured entry rate',
+        `${stats.writeBack.configuredEntriesPerMinute.toFixed(1)}/min`
+      ],
+      [
+        'Current adaptive entry rate',
+        `${stats.writeBack.currentEntriesPerMinute.toFixed(1)}/min`
+      ],
+      ['Observed reservations', `${reservationRate.toFixed(1)}/min`],
+      [
+        'Reservation pacing sleep',
+        `${(stats.writeBack.reservationSleepMs / 1000).toFixed(1)} s`
+      ],
+      ['Rate-limit responses', sawRateLimit ? `Yes (${rateLimitCount})` : 'No'],
+      ['Rate limited: reserve', String(stats.rateLimits.reserve)],
+      ['Rate limited: upload', String(stats.rateLimits.upload)],
+      ['Rate limited: finalize', String(stats.rateLimits.finalize)],
+      ['Rate limited: lookup', String(stats.rateLimits.lookup)],
+      ['Rate limited: download', String(stats.rateLimits.download)]
+    ])
+    .addTable([
+      [
+        {data: 'Pack catalog and reads', header: true},
+        {data: 'Value', header: true}
+      ],
+      ['Catalog refreshes', String(stats.catalog.refreshes)],
+      ['Bloom candidates', String(stats.catalog.bloomCandidates)],
+      ['Bloom false positives', String(stats.catalog.bloomFalsePositives)],
+      ['Range bytes downloaded', String(stats.catalog.rangeBytesDownloaded)]
+    ])
     .addRaw(
       `Backend calls: ${stats.backend.lookups} lookups, ${stats.backend.reservations} reservations, ${stats.backend.uploads} uploads, ${stats.backend.finalizations} finalizations. ` +
         `Peak spool usage: ${stats.peakInflightBytes} bytes.\n\n`
     )
 
-  const elapsedMinutes = Math.max(
-    1 / 60,
-    ((stats.stoppedAt ? Date.parse(stats.stoppedAt) : Date.now()) -
-      Date.parse(stats.startedAt)) /
-      60_000
-  )
-  const uploadRate = stats.backend.reservations / elapsedMinutes
-  const lookupRate = stats.backend.lookups / elapsedMinutes
-  if (uploadRate >= 160 || lookupRate >= 1200) {
+  if (reservationRate >= 160 || lookupRate >= 1200) {
     core.summary.addRaw(
-      `⚠️ Projected request pressure is ${uploadRate.toFixed(1)} uploads/min and ${lookupRate.toFixed(1)} lookups/min. Object-per-entry mode is intended for near-term, moderate-volume sharing.\n`
+      `⚠️ Projected request pressure is ${reservationRate.toFixed(1)} reservations/min and ${lookupRate.toFixed(1)} lookups/min. Object-per-entry mode is intended for near-term, moderate-volume sharing.\n`
     )
+  }
+  if (sawRateLimit) {
+    core.summary.addRaw(
+      `⚠️ GitHub rate-limited ${rateLimitCount} cache operation${rateLimitCount === 1 ? '' : 's'}. Our observed reservation rate was ${reservationRate.toFixed(1)}/min; other jobs and cache consumers may also be using the repository-wide budget.\n`
+    )
+  }
+  if (stats.writeBack.remainingObjects > 0) {
+    core.summary.addRaw(
+      `⚠️ ${stats.writeBack.remainingObjects} cache object${stats.writeBack.remainingObjects === 1 ? '' : 's'} remained unflushed at shutdown.\n`
+    )
+    if (stats.writeBack.remainingObjectIds.length > 0) {
+      const listed = stats.writeBack.remainingObjectIds
+        .map(value => `- \`${value}\``)
+        .join('\n')
+      const omitted =
+        stats.writeBack.remainingObjects -
+        stats.writeBack.remainingObjectIds.length
+      core.summary.addDetails(
+        'Unflushed cache objects',
+        `${listed}${omitted > 0 ? `\n- …and ${omitted} more` : ''}`
+      )
+    }
   }
   if (stats.casWriteFailed) {
     core.summary.addRaw(

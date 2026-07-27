@@ -23,7 +23,7 @@ export class Metrics {
     private readonly persist?: (snapshot: MetricsSnapshot) => Promise<void>
   ) {
     this.data = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       startedAt: new Date().toISOString(),
       readable,
       writable,
@@ -44,6 +44,35 @@ export class Metrics {
         downloads: 0,
         errors: 0,
         rateLimited: 0
+      },
+      rateLimits: {
+        reserve: 0,
+        upload: 0,
+        finalize: 0,
+        lookup: 0,
+        download: 0
+      },
+      writeBack: {
+        acceptedObjects: 0,
+        deduplicatedObjects: 0,
+        packedObjects: 0,
+        packsFinalized: 0,
+        packBytes: 0,
+        pendingObjects: 0,
+        pendingBytes: 0,
+        peakPendingBytes: 0,
+        remainingObjects: 0,
+        remainingObjectIds: [],
+        acBlockedByBarrier: 0,
+        reservationSleepMs: 0,
+        configuredEntriesPerMinute: 0,
+        currentEntriesPerMinute: 0
+      },
+      catalog: {
+        refreshes: 0,
+        bloomCandidates: 0,
+        bloomFalsePositives: 0,
+        rangeBytesDownloaded: 0
       },
       integrityFailures: 0,
       casWriteFailed: false,
@@ -69,6 +98,87 @@ export class Metrics {
 
   backend(name: keyof MetricsSnapshot['backend']): void {
     this.data.backend[name] += 1
+  }
+
+  rateLimit(name: keyof MetricsSnapshot['rateLimits']): void {
+    this.data.rateLimits[name] += 1
+    this.schedulePersist()
+  }
+
+  acceptedObject(): void {
+    this.data.writeBack.acceptedObjects += 1
+    this.schedulePersist()
+  }
+
+  deduplicatedObject(): void {
+    this.data.writeBack.deduplicatedObjects += 1
+    this.schedulePersist()
+  }
+
+  packedObjects(count: number): void {
+    this.data.writeBack.packedObjects += count
+    this.schedulePersist()
+  }
+
+  packFinalized(bytes: number): void {
+    this.data.writeBack.packsFinalized += 1
+    this.data.writeBack.packBytes += bytes
+    this.schedulePersist()
+  }
+
+  setPending(objects: number, bytes: number): void {
+    this.data.writeBack.pendingObjects = objects
+    this.data.writeBack.pendingBytes = bytes
+    this.data.writeBack.peakPendingBytes = Math.max(
+      this.data.writeBack.peakPendingBytes,
+      bytes
+    )
+    this.schedulePersist()
+  }
+
+  setRemainingObjects(
+    objects: number,
+    identities: readonly string[] = []
+  ): void {
+    this.data.writeBack.remainingObjects = objects
+    this.data.writeBack.remainingObjectIds = [...identities]
+    this.schedulePersist()
+  }
+
+  setAcBlockedByBarrier(objects: number): void {
+    this.data.writeBack.acBlockedByBarrier = objects
+    this.schedulePersist()
+  }
+
+  setPacer(
+    configuredEntriesPerMinute: number,
+    currentEntriesPerMinute: number,
+    reservationSleepMs: number
+  ): void {
+    this.data.writeBack.configuredEntriesPerMinute = configuredEntriesPerMinute
+    this.data.writeBack.currentEntriesPerMinute = currentEntriesPerMinute
+    this.data.writeBack.reservationSleepMs = reservationSleepMs
+    this.schedulePersist()
+  }
+
+  catalogRefresh(): void {
+    this.data.catalog.refreshes += 1
+    this.schedulePersist()
+  }
+
+  bloomCandidates(count: number): void {
+    this.data.catalog.bloomCandidates += count
+    this.schedulePersist()
+  }
+
+  bloomFalsePositive(): void {
+    this.data.catalog.bloomFalsePositives += 1
+    this.schedulePersist()
+  }
+
+  rangeBytesDownloaded(bytes: number): void {
+    this.data.catalog.rangeBytesDownloaded += bytes
+    this.schedulePersist()
   }
 
   read(

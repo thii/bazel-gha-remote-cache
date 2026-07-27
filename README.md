@@ -1,57 +1,65 @@
 # Bazel remote cache backed by GitHub Actions Cache v2
 
-This JavaScript action starts a loopback HTTP remote cache for Bazel and stores
-each action-cache (AC) or content-addressable storage (CAS) object as an
-immutable, raw GitHub Actions Cache v2 entry. It is intended to let parallel
-jobs in the same repository share Bazel outputs without operating a separate
-cache service.
+This action starts a loopback Bazel HTTP remote cache and stores its data in
+GitHub Actions Cache v2. Packed storage is the default: up to 256 Bazel AC/CAS
+objects are combined into one immutable cache entry, substantially reducing
+repository-wide cache-entry request pressure.
 
-> [!WARNING]
-> This project is an alpha. The object-per-entry design can exhaust GitHub's
-> cache request limits during a large build, and independent eviction can leave
-> an AC result without all of the CAS blobs it references. The supported alpha
-> profile is near-term sharing between concurrent or closely spaced jobs on
-> GitHub-hosted Linux runners. Do not treat it as durable artifact storage or a
-> general-purpose, high-volume Bazel cache.
+The adapter is a cache, not artifact storage. GitHub's normal cache scope,
+retention, capacity, and eviction rules still apply, and the action does not
+provide cross-repository sharing.
 
-## How it works
-
-The action starts a detached Node.js daemon bound to `127.0.0.1`. Bazel sends
-its normal HTTP remote-cache requests to that daemon:
+## Architecture
 
 ```text
-Bazel ── GET/PUT /cache/{ac,cas}/<digest> ──> loopback adapter
-                                                    │
-                                                    └──> Actions Cache v2
+Bazel PUT /cache/{cas,ac}/digest
+          │
+          ▼
+validate → fsync local spool → durable ordered queue → immediate 204
+                               │
+                               ▼
+                    mixed immutable pack builder
+                    (64 MiB / 256 objects / 8 s)
+                               │
+                               ▼
+                    repository-budget entry pacer
+                               │
+                               ▼
+                       Actions Cache v2
+
+Bazel GET → local accepted data → pack catalog + Bloom filter → range reads
+                                      │
+                                      └→ legacy object-v1 fallback
 ```
 
-The adapter maps each Bazel object to an exact, immutable cache key:
+CAS bodies are verified against the SHA-256 digest in the URL before
+acknowledgement. Every accepted CAS object receives a monotonic sequence, and
+an AC object records the latest accepted CAS sequence as its barrier. Packs
+are finalized in order, and a pack containing AC data cannot be published
+until its barriers are covered by CAS data in that pack or an earlier durable
+pack.
 
-```text
-/cache/ac/<digest>  -> brc-v1-<namespace>-ac-sha256-<digest>
-/cache/cas/<digest> -> brc-v1-<namespace>-cas-sha256-<digest>
-```
-
-Uploads and downloads use the Cache v2 raw-byte transfer contract directly;
-they are not tar archives produced by `actions/cache`. CAS request bodies are
-spooled to disk and checked against the SHA-256 digest in the URL before they
-are published. A post step shuts down the daemon, reports statistics, and
-removes its temporary control and spool files.
+The queue is bounded by `max-pending-bytes`. A PUT receives `204` only after
+its data and manifest have been synced locally; a full or failed queue returns
+`503`. Pending and recently committed objects are served directly from the
+runner, including during the short interval before GitHub's REST catalog shows
+a new pack. The post step drains for at most `flush-timeout-seconds` and reports
+anything left unflushed.
 
 ## Requirements
 
 - Bazel using its HTTP remote-cache protocol.
-- A GitHub Actions environment that exposes the Cache v2 runtime service. The
-  action fails at startup when Cache v2 is unavailable.
-- A GitHub-hosted Ubuntu runner for the supported alpha profile. A self-hosted
-  runner must be version `2.327.1` or later to run Node.js 24 actions, but
-  non-Linux platforms have not yet completed the alpha compatibility rollout.
+- A GitHub Actions environment exposing the Cache v2 runtime service.
+- Node.js 24 action support. Self-hosted runners must be version `2.327.1` or
+  later.
+- For packed reads, a token with repository `Actions: read` permission. The
+  `github-token` input defaults to `${{ github.token }}`.
 
 ## Usage
 
-Pin the action to a reviewed full commit SHA. Include the operating system,
-architecture, Bazel/toolchain versions, and a schema generation in the
-namespace so incompatible objects cannot collide.
+Pin the action to a reviewed full commit SHA. The namespace should include the
+operating system, architecture, Bazel/toolchain versions, and a schema
+generation so incompatible results cannot collide.
 
 ```yaml
 name: Bazel CI
@@ -62,6 +70,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   test:
@@ -77,10 +86,20 @@ jobs:
 
       - name: Start Bazel cache adapter
         id: cache
-        uses: thii/bazel-gha-remote-cache@v0.0.1
+        uses: thii/bazel-gha-remote-cache@<pinned-sha>
         with:
-          namespace: linux-amd64-bazel8-v1
-          mode: auto
+          namespace: linux-amd64-bazel8-v2
+          storage-mode: pack
+          github-token: ${{ github.token }}
+          repository-upload-budget: '120'
+          expected-writers: '4'
+          mode: >-
+            ${{ github.event_name == 'push' &&
+                github.ref == format(
+                  'refs/heads/{0}',
+                  github.event.repository.default_branch
+                ) &&
+                'read-write' || 'read-only' }}
 
       - name: Run shard
         shell: bash
@@ -91,14 +110,12 @@ jobs:
             --test_env=CI_SHARD=${{ matrix.shard }}
 ```
 
-For stronger supply-chain immutability, replace `v0.0.1` with the full commit
-SHA you reviewed. `--bazelrc` is a Bazel startup option, so it must appear
-before `build`, `test`, or another command.
+`--bazelrc` is a Bazel startup option and must appear before `build`, `test`,
+or another command. The generated file configures the loopback cache URL,
+remote timeout, raw transfer mode, and disables uploads whenever the resolved
+mode is read-only.
 
-The generated rc file configures the loopback URL, the requested remote
-timeout, and `--noremote_cache_compression`. It also adds
-`--remote_upload_local_results=false` whenever the resolved mode is read-only.
-You can use the `url` output instead if an existing rc file is more convenient:
+The `url` output can be used directly when an existing rc file is preferred:
 
 ```yaml
 - name: Run Bazel with the URL output
@@ -109,127 +126,149 @@ You can use the `url` output instead if an existing rc file is more convenient:
   run: |
     upload_flags=(--remote_upload_local_results=false)
     if [[ "$CACHE_WRITABLE" == "true" ]]; then upload_flags=(); fi
-    bazel test //... --remote_cache="$CACHE_URL" "${upload_flags[@]}"
+    bazel test //... \
+      --remote_cache="$CACHE_URL" \
+      --noremote_cache_compression \
+      "${upload_flags[@]}"
 ```
-
-When using `url` directly, retain the generated rc's timeout and compression
-settings as appropriate and always disable uploads when `writable` is false.
 
 ## Modes and trust boundaries
 
-| Mode         | Reads | Writes                                                    | Intended use                                       |
-| ------------ | ----- | --------------------------------------------------------- | -------------------------------------------------- |
-| `auto`       | Yes   | Only on a protected push to the repository default branch | Recommended default                                |
-| `read-only`  | Yes   | No                                                        | Pull requests, forks, and other untrusted triggers |
-| `read-write` | Yes   | Yes, except where the action enforces a read-only event   | Explicit trusted workflows                         |
+| Mode         | Reads | Writes                                                   |
+| ------------ | ----- | -------------------------------------------------------- |
+| `auto`       | Yes   | Only on a protected default-branch push                  |
+| `read-only`  | Yes   | No                                                       |
+| `read-write` | Yes   | Yes on trusted non-PR events when the runtime permits it |
 
-Pull-request events are always read-only, even if `read-write` is requested.
-The `readable` and `writable` outputs expose the resolved behavior, which lets a
-workflow assert its expectations.
+Pull-request and `pull_request_target` events are forcibly read-only. The
+`readable` and `writable` outputs expose the resolved behavior.
 
-The GitHub Actions runtime token and Cache v2 service URL remain inside the
-action process and its child daemon. The setup process sends them through a
-one-shot inherited pipe; the daemon receives an allowlisted environment, and
-the pipe closes before setup returns. The credentials are never action outputs
-and are not written to `GITHUB_ENV`. The server listens only on IPv4 loopback,
-and its shutdown endpoint is protected by a private token in the runner's
-temporary directory.
+The GitHub runtime token and Cache v2 URL are sent to the child daemon through
+a one-shot inherited pipe. `github-token` uses the same pipe and is used only
+for the supported REST cache-listing API; Cache v2 transfers continue to use
+the runtime token. Credentials are not action outputs or environment exports.
+The HTTP server binds only to `127.0.0.1`, and shutdown requires a private
+bearer token stored in the runner's temporary control directory.
 
-Treat restored cache bytes as untrusted input:
+Treat restored bytes as untrusted input. Do not cache secrets or signing
+material, keep untrusted workflows read-only, and use namespaces for
+compatibility separation rather than authorization.
 
-- Do not place credentials, signing material, or other secrets in Bazel build
-  outputs.
-- Keep pull requests read-only to reduce cache-poisoning risk.
-- Pin this action and other workflow actions to reviewed revisions when your
-  threat model requires immutable dependencies.
-- Use namespaces for compatibility separation, not as an authorization
-  boundary.
+## Storage modes
 
-GitHub applies its normal repository/ref cache scopes. Eligible jobs in one
-repository can share entries; this action does not support cross-repository
-sharing. A workflow that can read a cache may be able to inspect everything in
-that cache entry.
+| Configuration                               | Behavior                                           | Intended use                   |
+| ------------------------------------------- | -------------------------------------------------- | ------------------------------ |
+| `storage-mode: pack`                        | Ordered mixed pack-v1 entries, write-back required | Default and high-volume builds |
+| `storage-mode: object`, `write-back: true`  | Paced asynchronous object-per-entry writes         | Migration and diagnostics      |
+| `storage-mode: object`, `write-back: false` | Legacy synchronous object-per-entry writes         | Compatibility debugging only   |
+
+Pack keys are unique and immutable per writer. A 2,048-bit Bloom filter in
+each key eliminates definite-negative packs without downloading their indexes.
+For a possible match, the adapter performs an exact Cache v2 lookup, range
+reads the fixed trailer and sorted index, binary-searches `(kind, digest)`, and
+range reads only the payload. Indexes and signed URLs are cached locally, and
+cold concurrent index loads are coalesced.
+
+During migration, reads check local data, then pack-v1, then the legacy exact
+object key. Changing `namespace` is still recommended when the Bazel cache
+schema or toolchain compatibility changes.
+
+## Rate limiting
+
+GitHub's cache-entry limits are repository-wide: other matrix jobs,
+workflows, `actions/cache`, and BuildKit caches consume the same budget.
+`repository-upload-budget` is divided by `expected-writers` to derive each
+daemon's entry-creation rate. The token is acquired immediately before
+`CreateCacheEntry`; Azure upload blocks do not consume additional pacer tokens.
+
+The daemons run on isolated machines, so this is approximate coordination.
+The default budget of 120 entries/minute leaves headroom below GitHub's current
+200 uploads/minute limit. When a `429` is observed, the writer honors
+`Retry-After`, adds jitter, checks exact visibility before retrying, and halves
+its rate. Each clean minute adds 10% of the configured rate until it recovers.
+Catalog reads recognize GitHub REST rate limits returned as either `403` or
+`429`, honor `Retry-After` or `X-RateLimit-Reset`, and keep serving the last
+complete catalog without issuing more REST requests during the pause.
+
+Packed mode normally creates only a few entries per job, making approximate
+coordination practical. In object-per-entry mode, use one writable job and
+make other matrix jobs read-only; `upload-concurrency: 1` reduces bursts but
+does not enforce an entries-per-minute rate by itself.
 
 ## Inputs
 
-| Input                     | Default      | Meaning                                               |
-| ------------------------- | ------------ | ----------------------------------------------------- |
-| `namespace`               | `bazel-v1`   | Logical compatibility namespace and schema generation |
-| `mode`                    | `auto`       | `auto`, `read-only`, or `read-write`                  |
-| `port`                    | `0`          | Loopback port; `0` selects an available port          |
-| `max-object-size`         | `2147483648` | Maximum accepted Bazel object size in bytes (2 GiB)   |
-| `max-inflight-bytes`      | `4294967296` | Maximum bytes simultaneously being spooled (4 GiB)    |
-| `upload-concurrency`      | `4`          | Maximum concurrent object uploads                     |
-| `download-concurrency`    | `16`         | Maximum concurrent object downloads                   |
-| `remote-timeout-seconds`  | `30`         | Bazel and cache-service request timeout               |
-| `fail-job-on-cache-error` | `false`      | Fail the post step if a backend error was observed    |
+| Input                      | Default               | Meaning                                                |
+| -------------------------- | --------------------- | ------------------------------------------------------ |
+| `namespace`                | `bazel-v1`            | Logical compatibility namespace                        |
+| `mode`                     | `auto`                | `auto`, `read-only`, or `read-write`                   |
+| `storage-mode`             | `pack`                | `pack` or legacy `object` storage                      |
+| `github-token`             | `${{ github.token }}` | Token used only to list pack cache entries             |
+| `port`                     | `0`                   | Loopback port; `0` selects an available port           |
+| `max-object-size`          | `2147483648`          | Maximum object bytes (2 GiB)                           |
+| `max-inflight-bytes`       | `4294967296`          | Maximum bytes being request-spooled (4 GiB)            |
+| `max-pending-bytes`        | `4294967296`          | Queued and retained local source-data budget (4 GiB)   |
+| `upload-concurrency`       | `4`                   | Legacy synchronous upload concurrency                  |
+| `download-concurrency`     | `16`                  | Maximum concurrent remote read operations              |
+| `repository-upload-budget` | `120`                 | Desired repository-wide entries/minute budget          |
+| `expected-writers`         | `1`                   | Simultaneously writable adapter jobs                   |
+| `upload-burst`             | `2`                   | Initial per-daemon entry-creation burst                |
+| `write-back`               | `true`                | Acknowledge after durable local acceptance             |
+| `flush-timeout-seconds`    | `120`                 | Bounded post-step queue drain                          |
+| `pack-target-bytes`        | `67108864`            | Target pack payload bytes (64 MiB)                     |
+| `pack-max-objects`         | `256`                 | Maximum records per pack                               |
+| `pack-max-age-seconds`     | `8`                   | Oldest-record age that seals a pack                    |
+| `catalog-refresh-seconds`  | `300`                 | Minimum interval between miss-triggered REST refreshes |
+| `remote-timeout-seconds`   | `30`                  | Bazel and remote request timeout                       |
+| `fail-job-on-cache-error`  | `false`               | Fail post step after cache errors or unflushed data    |
 
-`namespace` must be 1–128 characters and may contain letters, digits, dots,
-underscores, and hyphens. `max-inflight-bytes` must be at least
-`max-object-size`; both limits are decimal byte counts.
-
-Set `fail-job-on-cache-error: true` in a cache compatibility canary or when a
-cache failure must be visible. The default keeps cache outages from masking the
-result of the Bazel build.
+`max-inflight-bytes` and `max-pending-bytes` must each be at least
+`max-object-size`; `pack-target-bytes` cannot exceed `max-pending-bytes`.
+Remotely durable local copies are evicted first when new writes need that
+budget. Request spools and pack sealing temporarily need additional space, so
+runner disk use can be higher than `max-pending-bytes`.
 
 ## Outputs
 
-| Output     | Meaning                                                        |
-| ---------- | -------------------------------------------------------------- |
-| `url`      | Loopback Bazel remote-cache URL, including the `/cache` prefix |
-| `readable` | Whether backend reads are enabled                              |
-| `writable` | Whether uploads are enabled after applying event policy        |
-| `bazelrc`  | Path to the generated temporary Bazel rc file                  |
+| Output     | Meaning                                      |
+| ---------- | -------------------------------------------- |
+| `url`      | Loopback remote-cache URL including `/cache` |
+| `readable` | Whether remote reads are enabled             |
+| `writable` | Whether PUTs are enabled after event policy  |
+| `bazelrc`  | Generated temporary Bazel rc path            |
 
-## Alpha limits and failure behavior
+## Failure behavior and metrics
 
-The direct backend creates one GitHub cache entry per Bazel object. GitHub's
-current repository-level service limits are 200 cache uploads per minute and
-1,500 downloads per minute. The default cache capacity is 10 GB; entries not
-accessed for more than seven days can be removed, and storage-pressure eviction
-uses last-access order. These service limits and policies can change
-independently of this project.
+A later remote write failure does not invalidate a successful local Bazel
+build, but it can lose cache population. The queue retains retryable failures
+until the drain deadline. Permanent errors stop new acceptance, and objects
+remaining at shutdown are listed in the job summary. Set
+`fail-job-on-cache-error: true` for compatibility canaries or workflows where
+cache degradation must fail the job.
 
-The adapter bounds transfer concurrency, honors `Retry-After`, and opens a
-write circuit breaker after a rate-limit response. If any CAS upload fails or
-is rate-limited, subsequent AC uploads are refused for the rest of the job so
-the adapter does not knowingly publish action results whose output blobs may be
-missing. Backend errors are summarized by the post step.
-
-Because AC and CAS entries are evicted independently, a retained action result
-can refer to an evicted blob. A future stable, high-volume backend needs packed
-objects and dependency-aware lookup; those features are deliberately outside
-the alpha.
+The summary reports accepted/deduplicated objects, packs and their averages,
+pending and remaining data, CAS-barrier blocking, configured/current/observed
+reservation rates, pacing sleep, rate-limit responses by operation, catalog
+refreshes, Bloom candidates and false positives, and range bytes downloaded. A
+low observed reservation rate alongside a rate-limit response is evidence that
+another repository job or cache consumer is using the shared quota.
 
 ## Development
 
-Node.js 24 and npm are required. The bundled `dist/` files are the action's
-runtime and must be regenerated whenever TypeScript sources change.
+Node.js 24 and npm are required. The checked-in `dist/` bundles must be rebuilt
+whenever TypeScript sources change.
 
 ```bash
 npm ci
 npm run check
 ```
 
-`npm run check` checks formatting, type-checks, runs the source tests, builds
-the three action entry points, verifies third-party notices, and exercises the
-bundled daemon against a fake Cache v2 service. To rebuild only the checked-in
-runtime bundle, run:
-
-```bash
-npm run build
-```
-
-The CI workflow rejects a change when rebuilding leaves `dist/` different from
-the committed bundle. The scheduled Cache v2 canary separately uploads one raw
-CAS object in a writer job and retrieves and verifies it in a dependent reader
-job, detecting changes in the implementation-level Cache v2 contract and
-reporting the cross-job finalization-to-verification latency.
+`npm run check` formats/checks sources, type-checks, runs unit and integration
+tests, rebuilds all action entry points, verifies third-party notices, and
+exercises the bundles against a fake Cache v2 service.
 
 ## License
 
-This project is available under the [MIT License](LICENSE). Minimal generated
-Cache v2 definitions vendored from `actions/toolkit` retain their upstream
-license and commit metadata under `src/vendor/actions-toolkit/`. License and
-attribution texts for npm code included in the action bundles are collected in
-[the third-party notices](THIRD_PARTY_NOTICES.md).
+This project is available under the [MIT License](LICENSE). Vendored Cache v2
+definitions retain their upstream license and metadata under
+`src/vendor/actions-toolkit/`; bundled dependency notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

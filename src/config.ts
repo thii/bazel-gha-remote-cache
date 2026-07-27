@@ -1,15 +1,27 @@
 import {readFile} from 'node:fs/promises'
 import {URL} from 'node:url'
-import type {EventContext, RequestedMode} from './model.js'
+import type {EventContext, RequestedMode, StorageMode} from './model.js'
 
 export interface ParsedInputs {
   namespace: string
   mode: RequestedMode
+  storageMode: StorageMode
+  githubToken: string
   port: number
   maxObjectSize: number
   maxInflightBytes: number
+  maxPendingBytes: number
   uploadConcurrency: number
   downloadConcurrency: number
+  repositoryUploadBudget: number
+  expectedWriters: number
+  uploadBurst: number
+  writeBack: boolean
+  flushTimeoutSeconds: number
+  packTargetBytes: number
+  packMaxObjects: number
+  packMaxAgeSeconds: number
+  catalogRefreshSeconds: number
   remoteTimeoutSeconds: number
   failJobOnCacheError: boolean
 }
@@ -68,6 +80,15 @@ export function parseInputs(reader: InputReader): ParsedInputs {
     throw new Error('mode must be auto, read-only, or read-write')
   }
 
+  const storageMode = (reader('storage-mode') || 'pack').toLowerCase()
+  if (storageMode !== 'object' && storageMode !== 'pack') {
+    throw new Error('storage-mode must be object or pack')
+  }
+  const writeBack = booleanInput(reader, 'write-back', 'true')
+  if (storageMode === 'pack' && !writeBack) {
+    throw new Error('write-back must be true when storage-mode is pack')
+  }
+
   const maxObjectSize = integerInput(
     reader,
     'max-object-size',
@@ -85,13 +106,36 @@ export function parseInputs(reader: InputReader): ParsedInputs {
   if (maxInflightBytes < maxObjectSize) {
     throw new Error('max-inflight-bytes must be at least max-object-size')
   }
+  const maxPendingBytes = integerInput(
+    reader,
+    'max-pending-bytes',
+    '4294967296',
+    1,
+    Number.MAX_SAFE_INTEGER
+  )
+  if (maxPendingBytes < maxObjectSize) {
+    throw new Error('max-pending-bytes must be at least max-object-size')
+  }
+  const packTargetBytes = integerInput(
+    reader,
+    'pack-target-bytes',
+    '67108864',
+    1,
+    Number.MAX_SAFE_INTEGER
+  )
+  if (packTargetBytes > maxPendingBytes) {
+    throw new Error('pack-target-bytes must not exceed max-pending-bytes')
+  }
 
   return {
     namespace,
     mode,
+    storageMode,
+    githubToken: reader('github-token'),
     port: integerInput(reader, 'port', '0', 0, 65535),
     maxObjectSize,
     maxInflightBytes,
+    maxPendingBytes,
     uploadConcurrency: integerInput(reader, 'upload-concurrency', '4', 1, 128),
     downloadConcurrency: integerInput(
       reader,
@@ -99,6 +143,39 @@ export function parseInputs(reader: InputReader): ParsedInputs {
       '16',
       1,
       256
+    ),
+    repositoryUploadBudget: integerInput(
+      reader,
+      'repository-upload-budget',
+      '120',
+      1,
+      200
+    ),
+    expectedWriters: integerInput(reader, 'expected-writers', '1', 1, 256),
+    uploadBurst: integerInput(reader, 'upload-burst', '2', 1, 200),
+    writeBack,
+    flushTimeoutSeconds: integerInput(
+      reader,
+      'flush-timeout-seconds',
+      '120',
+      1,
+      3600
+    ),
+    packTargetBytes,
+    packMaxObjects: integerInput(reader, 'pack-max-objects', '256', 1, 256),
+    packMaxAgeSeconds: integerInput(
+      reader,
+      'pack-max-age-seconds',
+      '8',
+      1,
+      300
+    ),
+    catalogRefreshSeconds: integerInput(
+      reader,
+      'catalog-refresh-seconds',
+      '300',
+      1,
+      3600
     ),
     remoteTimeoutSeconds: integerInput(
       reader,
@@ -177,6 +254,11 @@ export async function loadEventContext(
   environment: NodeJS.ProcessEnv = process.env
 ): Promise<EventContext> {
   let defaultBranch: string | undefined
+  const environmentBaseRef = environment['GITHUB_BASE_REF']
+  let baseBranch =
+    environmentBaseRef === undefined || environmentBaseRef.length === 0
+      ? undefined
+      : environmentBaseRef
   const eventPath = environment['GITHUB_EVENT_PATH']
   if (eventPath) {
     try {
@@ -192,6 +274,21 @@ export async function loadEventContext(
       ) {
         defaultBranch = value.repository.default_branch
       }
+      if (
+        typeof value === 'object' &&
+        value !== null &&
+        'pull_request' in value &&
+        typeof value.pull_request === 'object' &&
+        value.pull_request !== null &&
+        'base' in value.pull_request &&
+        typeof value.pull_request.base === 'object' &&
+        value.pull_request.base !== null &&
+        'ref' in value.pull_request.base &&
+        typeof value.pull_request.base.ref === 'string' &&
+        value.pull_request.base.ref.length > 0
+      ) {
+        baseBranch = value.pull_request.base.ref
+      }
     } catch {
       // Auto mode deliberately fails closed to read-only when context is absent.
     }
@@ -201,6 +298,7 @@ export async function loadEventContext(
     eventName: environment['GITHUB_EVENT_NAME'] ?? '',
     ref: environment['GITHUB_REF'] ?? '',
     refProtected: environment['GITHUB_REF_PROTECTED'] === 'true',
+    ...(baseBranch === undefined ? {} : {baseBranch}),
     ...(defaultBranch === undefined ? {} : {defaultBranch})
   }
 }

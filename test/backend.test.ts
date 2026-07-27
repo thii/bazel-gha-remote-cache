@@ -100,7 +100,7 @@ test('ActionsCacheBackend sends exact Twirp JSON paths, authentication, and prot
     assert.equal(headers.get('accept'), 'application/json')
     assert.equal(headers.get('authorization'), 'Bearer runtime-token')
     assert.equal(headers.get('content-type'), 'application/json')
-    assert.equal(headers.get('user-agent'), 'bazel-gha-remote-cache/0.0.1')
+    assert.equal(headers.get('user-agent'), 'bazel-gha-remote-cache/0.0.2')
     assert.ok(call.init?.signal instanceof AbortSignal)
   }
 })
@@ -314,4 +314,86 @@ test('parseRetryAfter supports delta seconds and HTTP dates', () => {
   assert.equal(parseRetryAfter('1.5', now), undefined)
   assert.equal(parseRetryAfter('not-a-date', now), undefined)
   assert.equal(parseRetryAfter(null, now), undefined)
+})
+
+test('openDownloadRange requires an exact 206 byte range', async () => {
+  const payload = Buffer.from('requested-range')
+  const {fetchImplementation, calls} = fakeFetch(
+    () =>
+      new Response(payload, {
+        status: 206,
+        headers: {
+          'Content-Length': String(payload.length),
+          'Content-Range': `bytes 7-${7 + payload.length - 1}/100`
+        }
+      })
+  )
+  const backend = new ActionsCacheBackend(
+    'https://results.example.test',
+    'token',
+    30,
+    fetchImplementation
+  )
+
+  const response = await backend.openDownloadRange(
+    'https://blob.example.test/pack?sig=secret',
+    7,
+    payload.length
+  )
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), payload)
+  assert.equal(calls.length, 1)
+  assert.equal(new Headers(calls[0]?.init?.headers).get('range'), 'bytes=7-21')
+
+  const invalid = new ActionsCacheBackend(
+    'https://results.example.test',
+    'token',
+    30,
+    async () => new Response(payload, {status: 200})
+  )
+  await assert.rejects(
+    invalid.openDownloadRange('https://blob.example.test/pack', 0, 1),
+    /range download failed with HTTP 200/
+  )
+})
+
+test('commitFile recovers idempotent conflicts and ambiguous finalization', async () => {
+  const backend = new ActionsCacheBackend(
+    'https://results.example.test',
+    'token',
+    30,
+    async () => jsonResponse({ok: false})
+  )
+  const calls: string[] = []
+  backend.reserve = async () => {
+    calls.push('reserve')
+    return {kind: 'reserved', uploadUrl: 'https://blob.example.test/upload'}
+  }
+  backend.uploadFile = async () => {
+    calls.push('upload')
+  }
+  backend.finalize = async () => {
+    calls.push('finalize')
+    throw new BackendError('ambiguous', {retryable: true})
+  }
+  backend.lookup = async () => {
+    calls.push('lookup')
+    return {kind: 'hit', downloadUrl: 'https://blob.example.test/download'}
+  }
+
+  assert.equal(
+    await backend.commitFile('key', 'version', '/unused', 12),
+    'already-exists'
+  )
+  assert.deepEqual(calls, ['reserve', 'upload', 'finalize', 'lookup'])
+
+  calls.length = 0
+  backend.reserve = async () => {
+    calls.push('reserve')
+    return {kind: 'conflict'}
+  }
+  assert.equal(
+    await backend.commitFile('key', 'version', '/unused', 12),
+    'already-exists'
+  )
+  assert.deepEqual(calls, ['reserve', 'lookup'])
 })

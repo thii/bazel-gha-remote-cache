@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: cache-v2-canary
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      finalized_at: ${{ steps.put.outputs.finalized_at }}
+      accepted_at: ${{ steps.put.outputs.accepted_at }}
 
     steps:
       - name: Check out the repository
@@ -31,8 +32,13 @@ jobs:
         with:
           namespace: canary-v1-${{ github.run_id }}-${{ github.run_attempt }}
           mode: read-write
+          storage-mode: pack
+          github-token: ${{ github.token }}
           max-object-size: '1048576'
           max-inflight-bytes: '1048576'
+          max-pending-bytes: '1048576'
+          pack-target-bytes: '1048576'
+          pack-max-age-seconds: '1'
           upload-concurrency: '1'
           download-concurrency: '1'
           fail-job-on-cache-error: 'true'
@@ -65,7 +71,7 @@ jobs:
             --data-binary "@$payload" \
             "${CACHE_URL%/}/cas/$digest"
 
-          echo "finalized_at=$(date -u +%s)" >>"$GITHUB_OUTPUT"
+          echo "accepted_at=$(date -u +%s)" >>"$GITHUB_OUTPUT"
 
   download:
     name: Download raw CAS object
@@ -83,8 +89,13 @@ jobs:
         with:
           namespace: canary-v1-${{ github.run_id }}-${{ github.run_attempt }}
           mode: read-only
+          storage-mode: pack
+          github-token: ${{ github.token }}
           max-object-size: '1048576'
           max-inflight-bytes: '1048576'
+          max-pending-bytes: '1048576'
+          pack-target-bytes: '1048576'
+          catalog-refresh-seconds: '15'
           upload-concurrency: '1'
           download-concurrency: '1'
           fail-job-on-cache-error: 'true'
@@ -95,13 +106,13 @@ jobs:
           CACHE_URL: ${{ steps.cache.outputs.url }}
           CACHE_READABLE: ${{ steps.cache.outputs.readable }}
           CACHE_WRITABLE: ${{ steps.cache.outputs.writable }}
-          FINALIZED_AT: ${{ needs.upload.outputs.finalized_at }}
+          ACCEPTED_AT: ${{ needs.upload.outputs.accepted_at }}
         run: |
           set -euo pipefail
 
           test "$CACHE_READABLE" = true
           test "$CACHE_WRITABLE" = false
-          [[ "$FINALIZED_AT" =~ ^[0-9]+$ ]]
+          [[ "$ACCEPTED_AT" =~ ^[0-9]+$ ]]
 
           expected="$RUNNER_TEMP/cache-v2-canary.expected"
           actual="$RUNNER_TEMP/cache-v2-canary.actual"
@@ -130,9 +141,9 @@ jobs:
           cmp --silent "$expected" "$actual"
 
           verified_at="$(date -u +%s)"
-          latency_seconds="$((verified_at - FINALIZED_AT))"
+          latency_seconds="$((verified_at - ACCEPTED_AT))"
           {
             echo '### Cache v2 cross-job canary'
             echo
-            echo "Verified the exact raw CAS bytes ${latency_seconds}s after finalization."
+            echo "Verified the exact packed CAS bytes ${latency_seconds}s after local acceptance."
           } >>"$GITHUB_STEP_SUMMARY"

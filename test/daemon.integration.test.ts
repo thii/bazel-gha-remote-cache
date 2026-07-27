@@ -15,6 +15,11 @@ import test from 'node:test'
 import {CONTROL_FILES, pathExists, readJsonFile} from '../src/control.js'
 import {sleep, validateDaemonReady, validateMetrics} from '../src/lifecycle.js'
 import type {DaemonConfig} from '../src/model.js'
+import {
+  PACK_CACHE_VERSION,
+  findPackIndexEntry,
+  parsePack
+} from '../src/pack-format.js'
 
 interface CapturedRequest {
   method: string
@@ -74,7 +79,7 @@ async function waitForExit(child: ChildProcess): Promise<number | null> {
   })
 }
 
-test('daemon performs raw Cache v2 create, blob upload, finalize, and exact restore', async t => {
+test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', async t => {
   const runtimeToken = `runtime-${randomBytes(16).toString('hex')}`
   const sasSignature = `sas-${randomBytes(16).toString('hex')}`
   const requests: CapturedRequest[] = []
@@ -171,15 +176,32 @@ test('daemon performs raw Cache v2 create, blob upload, finalize, and exact rest
   t.after(() => rm(controlDirectory, {recursive: true, force: true}))
   const config: DaemonConfig = {
     namespace: 'integration-v1',
+    storageMode: 'pack',
     port: 0,
     readable: true,
     writable: true,
     maxObjectSize: 1024 * 1024,
     maxInflightBytes: 1024 * 1024,
+    maxPendingBytes: 1024 * 1024,
     uploadConcurrency: 1,
     downloadConcurrency: 2,
+    repositoryUploadBudget: 120,
+    expectedWriters: 1,
+    uploadBurst: 2,
+    writeBack: true,
+    flushTimeoutSeconds: 5,
+    packTargetBytes: 1024 * 1024,
+    packMaxObjects: 256,
+    packMaxAgeSeconds: 1,
+    catalogRefreshSeconds: 15,
     remoteTimeoutSeconds: 5,
     failJobOnCacheError: true,
+    githubApiUrl: 'https://api.github.com',
+    githubRepository: 'test/integration',
+    currentRef: 'refs/heads/main',
+    defaultRef: 'refs/heads/main',
+    runId: '1',
+    jobHash: '0'.repeat(16),
     controlDirectory,
     shutdownToken: randomBytes(32).toString('base64url'),
     instanceId: randomUUID()
@@ -213,7 +235,8 @@ test('daemon performs raw Cache v2 create, blob upload, finalize, and exact rest
   credentialPipe.end(
     `${JSON.stringify({
       resultsUrl: `${serviceOrigin}/ignored/base/`,
-      runtimeToken
+      runtimeToken,
+      githubToken: 'github-catalog-token'
     })}\n`
   )
   child.stdout?.on('data', value => {
@@ -247,7 +270,11 @@ test('daemon performs raw Cache v2 create, blob upload, finalize, and exact rest
 
   const shutdown = await fetch(`${ready.url}/shutdown`, {
     method: 'POST',
-    headers: {Authorization: `Bearer ${config.shutdownToken}`}
+    headers: {
+      Authorization: `Bearer ${config.shutdownToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({drain: true, deadlineMs: 5000})
   })
   assert.equal(shutdown.status, 202)
   assert.equal(await waitForExit(child), 0)
@@ -260,19 +287,47 @@ test('daemon performs raw Cache v2 create, blob upload, finalize, and exact rest
   assert.equal(stats.writes.cas.successes, 1)
   assert.equal(stats.reads.cas.hits, 1)
   assert.equal(stats.backend.errors, 0)
+  assert.equal(stats.writeBack.acceptedObjects, 1)
+  assert.equal(stats.writeBack.packedObjects, 1)
+  assert.equal(stats.writeBack.packsFinalized, 1)
+  assert.equal(stats.writeBack.remainingObjects, 0)
+
+  assert.equal(finalized.size, 1)
+  const [packKey, packBytes] = [...finalized.entries()][0] ?? []
+  assert.ok(packKey?.startsWith('brc2-'))
+  assert.ok(packBytes)
+  const parsedPack = parsePack(packBytes)
+  const entry = findPackIndexEntry(parsedPack.entries, 'cas', objectDigest)
+  assert.ok(entry)
+  assert.deepEqual(
+    packBytes.subarray(
+      Number(entry.offset),
+      Number(entry.offset + entry.length)
+    ),
+    payload
+  )
+
+  const finalizedRequest = requests.find(request =>
+    request.path.endsWith('/FinalizeCacheEntryUpload')
+  )
+  assert.ok(finalizedRequest)
+  const finalizedInput = JSON.parse(
+    finalizedRequest.body.toString('utf8')
+  ) as Record<string, unknown>
+  assert.equal(finalizedInput['version'], PACK_CACHE_VERSION)
 
   const controlRequests = requests.filter(request =>
     request.path.startsWith('/twirp/')
   )
   assert.deepEqual(
     controlRequests.map(request => request.path.split('/').at(-1)),
-    ['CreateCacheEntry', 'FinalizeCacheEntryUpload', 'GetCacheEntryDownloadURL']
+    ['CreateCacheEntry', 'FinalizeCacheEntryUpload']
   )
   for (const request of controlRequests) {
     assert.equal(request.authorization, `Bearer ${runtimeToken}`)
     assert.equal(
       JSON.parse(request.body.toString()).version,
-      '11acdfc3e9b90ded551d471f1478526b0bc5196d2407af7be873fb20f89da139'
+      PACK_CACHE_VERSION
     )
   }
   for (const request of requests.filter(request =>

@@ -42,9 +42,23 @@ class MemoryBackend implements CacheBackend {
     version: string,
     signal?: AbortSignal
   ) => Promise<CacheLookup>
-  reserveHook?: (key: string, version: string) => Promise<CacheReservation>
-  uploadHook?: (key: string, filePath: string, size: number) => Promise<void>
-  finalizeHook?: (key: string, version: string, size: number) => Promise<void>
+  reserveHook?: (
+    key: string,
+    version: string,
+    signal?: AbortSignal
+  ) => Promise<CacheReservation>
+  uploadHook?: (
+    key: string,
+    filePath: string,
+    size: number,
+    signal?: AbortSignal
+  ) => Promise<void>
+  finalizeHook?: (
+    key: string,
+    version: string,
+    size: number,
+    signal?: AbortSignal
+  ) => Promise<void>
   downloadHook?: (signedUrl: string, signal?: AbortSignal) => Promise<Response>
 
   async lookup(
@@ -59,9 +73,14 @@ class MemoryBackend implements CacheBackend {
       : {kind: 'miss'}
   }
 
-  async reserve(key: string, version: string): Promise<CacheReservation> {
+  async reserve(
+    key: string,
+    version: string,
+    signal?: AbortSignal
+  ): Promise<CacheReservation> {
+    if (signal?.aborted) throw new Error('cache reservation aborted')
     this.reserveCalls.push({key, version})
-    if (this.reserveHook) return this.reserveHook(key, version)
+    if (this.reserveHook) return this.reserveHook(key, version, signal)
     return this.objects.has(key)
       ? {kind: 'conflict'}
       : {kind: 'reserved', uploadUrl: this.urlFor(key)}
@@ -70,17 +89,27 @@ class MemoryBackend implements CacheBackend {
   async uploadFile(
     signedUrl: string,
     filePath: string,
-    size: number
+    size: number,
+    signal?: AbortSignal
   ): Promise<void> {
+    if (signal?.aborted) throw new Error('cache upload aborted')
     const key = this.keyFromUrl(signedUrl)
     this.uploadCalls.push({key, size})
-    if (this.uploadHook) return this.uploadHook(key, filePath, size)
+    if (this.uploadHook) return this.uploadHook(key, filePath, size, signal)
     this.staged.set(key, await readFile(filePath))
   }
 
-  async finalize(key: string, version: string, size: number): Promise<void> {
+  async finalize(
+    key: string,
+    version: string,
+    size: number,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (signal?.aborted) throw new Error('cache finalization aborted')
     this.finalizeCalls.push({key, version, size})
-    if (this.finalizeHook) return this.finalizeHook(key, version, size)
+    if (this.finalizeHook) {
+      return this.finalizeHook(key, version, size, signal)
+    }
     const value = this.staged.get(key)
     if (!value) throw new BackendError('no staged object')
     this.objects.set(key, value)
@@ -101,6 +130,53 @@ class MemoryBackend implements CacheBackend {
         'Content-Type': 'application/octet-stream'
       }
     })
+  }
+
+  async openDownloadRange(
+    signedUrl: string,
+    offset: number,
+    length: number,
+    signal?: AbortSignal
+  ): Promise<Response> {
+    if (signal?.aborted) throw new Error('range download aborted')
+    const value = this.objects.get(this.keyFromUrl(signedUrl))
+    if (!value) throw new BackendError('missing signed object')
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(length) ||
+      length < 1 ||
+      offset + length > value.length
+    ) {
+      throw new BackendError('invalid signed object range')
+    }
+    const body = value.subarray(offset, offset + length)
+    return new Response(Uint8Array.from(body), {
+      status: 206,
+      headers: {
+        'Content-Length': String(body.length),
+        'Content-Range': `bytes ${offset}-${offset + length - 1}/${value.length}`,
+        'Content-Type': 'application/octet-stream'
+      }
+    })
+  }
+
+  async commitFile(
+    key: string,
+    version: string,
+    filePath: string,
+    size: number,
+    signal?: AbortSignal
+  ): Promise<'created' | 'already-exists'> {
+    if (signal?.aborted) throw new Error('cache commit aborted')
+    const reservation = await this.reserve(key, version, signal)
+    if (reservation.kind === 'conflict') return 'already-exists'
+    if (!reservation.uploadUrl) {
+      throw new BackendError('cache reservation omitted an upload URL')
+    }
+    await this.uploadFile(reservation.uploadUrl, filePath, size, signal)
+    await this.finalize(key, version, size, signal)
+    return 'created'
   }
 
   private urlFor(key: string): string {
@@ -132,15 +208,32 @@ async function startServer(
   )
   const config: DaemonConfig = {
     namespace: 'test-v1',
+    storageMode: 'object',
     port: 0,
     readable: true,
     writable: true,
     maxObjectSize: 1024 * 1024,
     maxInflightBytes: 2 * 1024 * 1024,
+    maxPendingBytes: 2 * 1024 * 1024,
     uploadConcurrency: 2,
     downloadConcurrency: 2,
+    repositoryUploadBudget: 120,
+    expectedWriters: 1,
+    uploadBurst: 2,
+    writeBack: false,
+    flushTimeoutSeconds: 120,
+    packTargetBytes: 1024 * 1024,
+    packMaxObjects: 256,
+    packMaxAgeSeconds: 8,
+    catalogRefreshSeconds: 15,
     remoteTimeoutSeconds: 30,
     failJobOnCacheError: false,
+    githubApiUrl: 'https://api.github.com',
+    githubRepository: 'test/server',
+    currentRef: 'refs/heads/main',
+    defaultRef: 'refs/heads/main',
+    runId: '1',
+    jobHash: '0'.repeat(16),
     controlDirectory,
     shutdownToken: 'a'.repeat(43),
     instanceId: randomUUID(),

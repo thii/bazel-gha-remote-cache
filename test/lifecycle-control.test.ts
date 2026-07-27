@@ -13,15 +13,33 @@ import {
 
 const validConfig = {
   namespace: 'bazel-v1',
+  storageMode: 'pack',
   port: 0,
   readable: true,
   writable: false,
   maxObjectSize: 100,
   maxInflightBytes: 200,
+  maxPendingBytes: 1000,
   uploadConcurrency: 4,
   downloadConcurrency: 16,
+  repositoryUploadBudget: 120,
+  expectedWriters: 1,
+  uploadBurst: 2,
+  writeBack: true,
+  flushTimeoutSeconds: 120,
+  packTargetBytes: 500,
+  packMaxObjects: 256,
+  packMaxAgeSeconds: 8,
+  catalogRefreshSeconds: 15,
   remoteTimeoutSeconds: 30,
   failJobOnCacheError: false,
+  githubApiUrl: 'https://api.github.com',
+  githubRepository: 'owner/repository',
+  currentRef: 'refs/heads/topic',
+  baseRef: 'refs/heads/release/v1',
+  defaultRef: 'refs/heads/main',
+  runId: '123456789',
+  jobHash: '1'.repeat(16),
   controlDirectory: path.resolve('/runner/temp/bazel-gha-cache-abc'),
   shutdownToken: 'a'.repeat(32),
   instanceId: '12345678-1234-1234-1234-123456789abc'
@@ -48,8 +66,32 @@ test('validateDaemonConfig rejects malformed security and resource fields', () =
       error: /invalid maxInflightBytes/
     },
     {
+      value: {...validConfig, storageMode: 'archive'},
+      error: /invalid storageMode/
+    },
+    {
+      value: {...validConfig, writeBack: false},
+      error: /packed storage requires write-back/
+    },
+    {
+      value: {...validConfig, githubRepository: 'owner/repo/extra'},
+      error: /invalid GitHub repository/
+    },
+    {
+      value: {...validConfig, baseRef: 'refs/tags/release-v1'},
+      error: /invalid Git ref/
+    },
+    {
+      value: {...validConfig, runId: 'local'},
+      error: /invalid run ID/
+    },
+    {
       value: {...validConfig, uploadConcurrency: 0},
       error: /invalid uploadConcurrency/
+    },
+    {
+      value: {...validConfig, packMaxObjects: 257},
+      error: /invalid packMaxObjects/
     },
     {
       value: {...validConfig, controlDirectory: 'relative/path'},
@@ -187,7 +229,7 @@ test('validateMetrics rejects missing or malformed nested control data', () => {
 
   assert.throws(
     () => validateMetrics({schemaVersion: 2}),
-    /unknown metrics schema/
+    /control data must be a JSON object/
   )
   assert.throws(() => validateMetrics([]), /control data must be a JSON object/)
 })
@@ -203,6 +245,9 @@ test('metricsHaveCacheErrors enforces strict post-step health', () => {
     },
     (stats: typeof clean) => {
       stats.backend.errors = 1
+    },
+    (stats: typeof clean) => {
+      stats.backend.rateLimited = 1
     },
     (stats: typeof clean) => {
       stats.reads.ac.errors = 1

@@ -4,6 +4,7 @@ import {
   type IncomingMessage,
   type ServerResponse
 } from 'node:http'
+import {createReadStream} from 'node:fs'
 import {mkdir, open, rm} from 'node:fs/promises'
 import path from 'node:path'
 import {Readable, Transform} from 'node:stream'
@@ -13,6 +14,8 @@ import type {AddressInfo} from 'node:net'
 import {BackendError, type CacheBackend, type CacheLookup} from './backend.js'
 import {CapacityLimiter} from './concurrency.js'
 import {Metrics} from './metrics.js'
+import type {PackReader} from './pack-reader.js'
+import type {WriteBackQueue} from './writeback.js'
 import {
   CACHE_KEY_PREFIX,
   CACHE_VERSION,
@@ -221,6 +224,8 @@ export interface CacheServerOptions {
   backend: CacheBackend
   metrics: Metrics
   onShutdown: () => void
+  writeBack?: WriteBackQueue
+  packReader?: PackReader
   now?: () => number
   sleep?: (milliseconds: number) => Promise<void>
   shutdownDrainMs?: number
@@ -387,6 +392,7 @@ export class CacheHttpServer {
   private readonly activeRequestControllers = new Set<AbortController>()
   private shuttingDown = false
   private started = false
+  private requestedFlushDeadlineMs: number | undefined
 
   private readonly server = createServer((request, response) => {
     void this.dispatch(request, response)
@@ -431,7 +437,7 @@ export class CacheHttpServer {
           this.options.metrics.request('put')
           this.options.metrics.request('rejected')
           this.options.metrics.write(parsed.kind, 'error', 0, 0)
-          if (parsed.kind === 'cas') {
+          if (parsed.kind === 'cas' && this.options.writeBack === undefined) {
             this.integrity.failCas()
             this.options.metrics.setCasWriteFailed()
           }
@@ -458,6 +464,7 @@ export class CacheHttpServer {
         const parsed = parseObjectPath(request.url)
         if (
           parsed?.kind === 'cas' &&
+          this.options.writeBack === undefined &&
           request.method === 'PUT' &&
           this.options.config.writable
         ) {
@@ -477,6 +484,7 @@ export class CacheHttpServer {
   async start(): Promise<AddressInfo> {
     if (this.started) throw new Error('cache server already started')
     await mkdir(this.spoolDirectory, {recursive: true, mode: 0o700})
+    await this.options.writeBack?.start()
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error)
       this.server.once('error', onError)
@@ -515,6 +523,12 @@ export class CacheHttpServer {
     })
     this.started = false
     this.activeRequestControllers.clear()
+    if (this.options.writeBack !== undefined) {
+      await this.options.writeBack.drain(
+        this.requestedFlushDeadlineMs ??
+          this.options.config.flushTimeoutSeconds * 1000
+      )
+    }
     await rm(this.spoolDirectory, {recursive: true, force: true}).catch(
       () => {}
     )
@@ -527,13 +541,18 @@ export class CacheHttpServer {
     try {
       if (request.url === '/healthz' && request.method === 'GET') {
         this.options.metrics.request('health')
+        const writeBack = this.options.writeBack?.snapshot()
         writeJson(response, 200, {
           status: this.shuttingDown ? 'stopping' : 'ok',
           pid: process.pid,
           instanceId: this.options.config.instanceId,
           readable: this.options.config.readable,
           writable: this.options.config.writable,
-          casHealthy: this.integrity.healthy
+          casHealthy:
+            writeBack === undefined
+              ? this.integrity.healthy
+              : !writeBack.failed,
+          ...(writeBack ?? {})
         })
         return
       }
@@ -548,7 +567,47 @@ export class CacheHttpServer {
           writeEmpty(response, 401)
           return
         }
-        writeEmpty(response, 202)
+        try {
+          const raw = await this.readShutdownBody(request)
+          if (raw !== undefined) {
+            const value = JSON.parse(raw) as unknown
+            if (
+              typeof value !== 'object' ||
+              value === null ||
+              Array.isArray(value)
+            ) {
+              throw new Error('invalid shutdown request')
+            }
+            const data = value as Record<string, unknown>
+            if (
+              data['drain'] !== undefined &&
+              typeof data['drain'] !== 'boolean'
+            ) {
+              throw new Error('invalid shutdown request')
+            }
+            if (
+              data['deadlineMs'] !== undefined &&
+              (typeof data['deadlineMs'] !== 'number' ||
+                !Number.isSafeInteger(data['deadlineMs']) ||
+                data['deadlineMs'] < 0)
+            ) {
+              throw new Error('invalid shutdown request')
+            }
+            const requested =
+              data['drain'] === false
+                ? 0
+                : ((data['deadlineMs'] as number | undefined) ??
+                  this.options.config.flushTimeoutSeconds * 1000)
+            this.requestedFlushDeadlineMs = Math.min(
+              requested,
+              this.options.config.flushTimeoutSeconds * 1000
+            )
+          }
+        } catch {
+          writeEmpty(response, 400)
+          return
+        }
+        writeEmpty(response, 202, {Connection: 'close'})
         setImmediate(this.options.onShutdown)
         return
       }
@@ -574,6 +633,15 @@ export class CacheHttpServer {
           return
         }
         const controller = this.requestController(request, response)
+        if (this.options.writeBack !== undefined) {
+          await this.handleWriteBackPut(
+            request,
+            response,
+            object,
+            controller.signal
+          )
+          return
+        }
         let finishCas: ((success: boolean) => void) | undefined
         try {
           if (object.kind === 'cas') {
@@ -597,12 +665,56 @@ export class CacheHttpServer {
     }
   }
 
+  private async readShutdownBody(
+    request: IncomingMessage
+  ): Promise<string | undefined> {
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const value of request) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
+      size += chunk.length
+      if (size > 4096) throw new Error('shutdown request was too large')
+      chunks.push(chunk)
+    }
+    return size === 0 ? undefined : Buffer.concat(chunks).toString('utf8')
+  }
+
   private async handleGet(
     request: IncomingMessage,
     response: ServerResponse,
     object: ObjectPath
   ): Promise<void> {
     const startedAt = Date.now()
+    const local = await this.options.writeBack?.openLocal(
+      object.kind,
+      object.digest
+    )
+    if (local !== undefined) {
+      try {
+        response.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(local.size)
+        })
+        await pipeline(local.stream, response)
+        this.options.metrics.read(
+          object.kind,
+          'hit',
+          local.size,
+          Date.now() - startedAt
+        )
+      } catch (error) {
+        if (!response.destroyed) {
+          response.destroy(error instanceof Error ? error : undefined)
+        }
+        this.options.metrics.read(
+          object.kind,
+          'error',
+          0,
+          Date.now() - startedAt
+        )
+      }
+      return
+    }
     if (!this.options.config.readable) {
       this.options.metrics.read(object.kind, 'miss', 0, Date.now() - startedAt)
       writeEmpty(response, 404)
@@ -620,6 +732,79 @@ export class CacheHttpServer {
         return
       }
       throw this.circuitRequestError(error)
+    }
+
+    if (this.options.packReader !== undefined) {
+      let release: (() => void) | undefined
+      let materialized
+      try {
+        release = await this.downloadLimiter.acquire(1, controller.signal)
+        this.readCircuit.assertAllowed(lease)
+        materialized = await this.options.packReader.materialize(
+          object.kind,
+          object.digest,
+          controller.signal
+        )
+      } catch (error) {
+        if (controller.signal.aborted) {
+          this.readCircuit.complete(lease)
+          this.options.metrics.read(
+            object.kind,
+            'error',
+            0,
+            Date.now() - startedAt
+          )
+          return
+        }
+        if (error instanceof BackendError && error.rateLimited) {
+          this.handleRateLimit(error, this.readCircuit)
+          this.options.metrics.read(
+            object.kind,
+            'error',
+            0,
+            Date.now() - startedAt
+          )
+          if (object.kind === 'ac') {
+            writeEmpty(response, 404)
+            return
+          }
+          throw this.backendRequestError(error)
+        }
+        // Catalog and corrupt-candidate failures degrade to the legacy exact
+        // object lookup during the migration window.
+      } finally {
+        release?.()
+      }
+      if (materialized !== undefined) {
+        try {
+          response.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(materialized.size)
+          })
+          await pipeline(createReadStream(materialized.path), response)
+          this.options.metrics.read(
+            object.kind,
+            'hit',
+            materialized.size,
+            Date.now() - startedAt
+          )
+          this.readCircuit.complete(lease)
+        } catch (error) {
+          this.readCircuit.complete(lease)
+          this.options.metrics.read(
+            object.kind,
+            'error',
+            0,
+            Date.now() - startedAt
+          )
+          if (!response.destroyed) {
+            response.destroy(error instanceof Error ? error : undefined)
+          }
+        } finally {
+          await materialized.dispose().catch(() => {})
+        }
+        return
+      }
     }
 
     const key = objectCacheKey(
@@ -926,6 +1111,98 @@ export class CacheHttpServer {
     }
   }
 
+  private async handleWriteBackPut(
+    request: IncomingMessage,
+    response: ServerResponse,
+    object: ObjectPath,
+    signal: AbortSignal
+  ): Promise<void> {
+    const writeBack = this.options.writeBack
+    if (writeBack === undefined)
+      throw new Error('write-back queue is unavailable')
+    const startedAt = Date.now()
+    let size = 0
+    let releaseBytes: (() => void) | undefined
+    let spoolPath: string | undefined
+    try {
+      const contentEncoding = request.headers['content-encoding']?.toLowerCase()
+      if (contentEncoding !== undefined && contentEncoding !== 'identity') {
+        throw new RequestError(415, 'content encoding is not supported')
+      }
+      const expectedSize = requestContentLength(request)
+      if (
+        expectedSize !== undefined &&
+        expectedSize > this.options.config.maxObjectSize
+      ) {
+        throw new RequestError(413, 'cache object exceeds max-object-size')
+      }
+      const reservationSize = expectedSize ?? this.options.config.maxObjectSize
+      releaseBytes = await this.byteLimiter.acquire(reservationSize, signal)
+      this.options.metrics.setInflightBytes(this.byteLimiter.used)
+      spoolPath = path.join(
+        this.spoolDirectory,
+        `${randomBytes(16).toString('hex')}.spool`
+      )
+      const spooled = await spoolRequest(
+        request,
+        spoolPath,
+        this.options.config.maxObjectSize,
+        expectedSize
+      )
+      size = spooled.size
+      if (object.kind === 'cas' && spooled.digest !== object.digest) {
+        this.options.metrics.integrityFailure()
+        throw new RequestError(400, 'CAS digest did not match request bytes')
+      }
+
+      const accepted = await writeBack.accept(
+        object.kind,
+        object.digest,
+        spoolPath,
+        size,
+        spooled.digest
+      )
+      if (
+        accepted.kind === 'accepted' ||
+        accepted.kind === 'duplicate' ||
+        accepted.kind === 'conflict'
+      ) {
+        spoolPath = undefined
+      }
+      if (accepted.kind === 'full' || accepted.kind === 'failed') {
+        throw new RequestError(503, 'write-back queue cannot accept the object')
+      }
+      if (accepted.kind === 'conflict') {
+        throw new RequestError(409, 'cache object body changed for its digest')
+      }
+      this.options.metrics.write(
+        object.kind,
+        'success',
+        size,
+        Date.now() - startedAt
+      )
+      writeEmpty(response, 204)
+    } catch (error) {
+      this.options.metrics.write(
+        object.kind,
+        error instanceof RequestError && error.statusCode === 409
+          ? 'conflict'
+          : 'error',
+        size,
+        Date.now() - startedAt
+      )
+      if (error instanceof RequestError) throw error
+      if (signal.aborted) throw new RequestError(499, 'request aborted')
+      throw new RequestError(500, 'failed to enqueue cache upload')
+    } finally {
+      if (spoolPath !== undefined) {
+        await rm(spoolPath, {force: true}).catch(() => {})
+      }
+      releaseBytes?.()
+      this.options.metrics.setInflightBytes(this.byteLimiter.used)
+    }
+  }
+
   private async lookupSingleFlight(
     key: string,
     lease: CircuitLease,
@@ -974,9 +1251,11 @@ export class CacheHttpServer {
   ): AbortController {
     const controller = abortForRequest(request, response)
     this.activeRequestControllers.add(controller)
-    response.once('close', () => {
+    const cleanup = (): void => {
       this.activeRequestControllers.delete(controller)
-    })
+    }
+    response.once('finish', cleanup)
+    response.once('close', cleanup)
     return controller
   }
 

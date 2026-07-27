@@ -47,6 +47,19 @@ export interface CacheBackend {
     signal?: AbortSignal
   ): Promise<void>
   openDownload(signedUrl: string, signal?: AbortSignal): Promise<Response>
+  openDownloadRange(
+    signedUrl: string,
+    offset: number,
+    length: number,
+    signal?: AbortSignal
+  ): Promise<Response>
+  commitFile(
+    key: string,
+    version: string,
+    filePath: string,
+    size: number,
+    signal?: AbortSignal
+  ): Promise<'created' | 'already-exists'>
 }
 
 export class BackendError extends Error {
@@ -209,7 +222,7 @@ class TwirpJsonTransport {
             Accept: 'application/json',
             Authorization: `Bearer ${this.token}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'bazel-gha-remote-cache/0.0.1'
+            'User-Agent': 'bazel-gha-remote-cache/0.0.2'
           },
           body: JSON.stringify(data),
           redirect: 'error',
@@ -544,6 +557,115 @@ export class ActionsCacheBackend implements CacheBackend {
         cause: error
       })
     }
+  }
+
+  async openDownloadRange(
+    signedUrl: string,
+    offset: number,
+    length: number,
+    signal?: AbortSignal
+  ): Promise<Response> {
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(length) ||
+      length < 1 ||
+      offset + length > Number.MAX_SAFE_INTEGER
+    ) {
+      throw new BackendError('invalid signed cache download range')
+    }
+    try {
+      const response = await this.fetchImplementation(
+        assertSignedUrl(signedUrl, 'download'),
+        {
+          method: 'GET',
+          headers: {Range: `bytes=${offset}-${offset + length - 1}`},
+          redirect: 'error',
+          signal: combinedTimeoutSignal(this.timeoutMs, signal)
+        }
+      )
+      const expectedContentRange = `bytes ${offset}-${offset + length - 1}/`
+      const contentRange = response.headers.get('content-range')
+      const contentLength = response.headers.get('content-length')
+      if (
+        response.status !== 206 ||
+        contentRange === null ||
+        !contentRange.toLowerCase().startsWith(expectedContentRange) ||
+        contentLength !== String(length)
+      ) {
+        const retryAfterMs = parseRetryAfter(
+          response.headers.get('retry-after')
+        )
+        const status = response.status
+        await response.body?.cancel().catch(() => {})
+        throw new BackendError(
+          `signed cache range download failed with HTTP ${status}`,
+          {
+            statusCode: status,
+            retryable: status >= 500,
+            rateLimited: status === 429,
+            ...(retryAfterMs === undefined ? {} : {retryAfterMs})
+          }
+        )
+      }
+      if (response.body === null) {
+        throw new BackendError('signed cache range download returned no body')
+      }
+      return response
+    } catch (error) {
+      if (error instanceof BackendError) throw error
+      throw new BackendError('signed cache range download failed', {
+        retryable: true,
+        cause: error
+      })
+    }
+  }
+
+  async commitFile(
+    key: string,
+    version: string,
+    filePath: string,
+    size: number,
+    signal?: AbortSignal
+  ): Promise<'created' | 'already-exists'> {
+    const reservation = await this.reserve(key, version, signal)
+    if (reservation.kind === 'conflict') {
+      if (await this.waitForVisibility(key, version, signal)) {
+        return 'already-exists'
+      }
+      throw new BackendError('conflicting cache entry did not become visible', {
+        retryable: true
+      })
+    }
+    if (!reservation.uploadUrl) {
+      throw new BackendError('cache reservation omitted an upload URL')
+    }
+    try {
+      await this.uploadFile(reservation.uploadUrl, filePath, size, signal)
+      await this.finalize(key, version, size, signal)
+      return 'created'
+    } catch (error) {
+      if (
+        await this.waitForVisibility(key, version, signal).catch(() => false)
+      ) {
+        return 'already-exists'
+      }
+      throw error
+    }
+  }
+
+  private async waitForVisibility(
+    key: string,
+    version: string,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (signal?.aborted) throw new Error('request aborted')
+      const lookup = await this.lookup(key, version, signal)
+      if (lookup.kind === 'hit') return true
+      if (attempt < 4) await delay(100 * 2 ** attempt, signal)
+    }
+    return false
   }
 
   private withSignal<T>(

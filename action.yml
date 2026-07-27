@@ -1,5 +1,5 @@
 name: Bazel remote cache backed by GitHub Actions Cache v2
-description: Starts a loopback Bazel HTTP remote-cache adapter
+description: Starts a paced, packed loopback Bazel cache backed by Actions Cache v2
 author: bazel-gha-remote-cache contributors
 
 inputs:
@@ -9,6 +9,13 @@ inputs:
   mode:
     description: auto, read-only, or read-write
     default: auto
+  storage-mode:
+    description: Packed or legacy object-per-entry storage
+    default: pack
+  github-token:
+    description: Token with Actions read permission used to discover pack entries
+    required: false
+    default: ${{ github.token }}
   port:
     description: Loopback port; 0 selects an available port
     default: '0'
@@ -18,12 +25,42 @@ inputs:
   max-inflight-bytes:
     description: Maximum bytes simultaneously being spooled
     default: '4294967296'
+  max-pending-bytes:
+    description: Maximum queued and retained local source bytes
+    default: '4294967296'
   upload-concurrency:
-    description: Maximum number of concurrent object uploads
+    description: Maximum concurrent uploads in legacy synchronous object mode
     default: '4'
   download-concurrency:
     description: Maximum number of concurrent object downloads
     default: '16'
+  repository-upload-budget:
+    description: Repository-wide cache-entry budget used for proactive pacing
+    default: '120'
+  expected-writers:
+    description: Expected maximum number of simultaneous writable adapter jobs
+    default: '1'
+  upload-burst:
+    description: Initial cache-entry creation burst allowed per daemon
+    default: '2'
+  write-back:
+    description: Acknowledge writes after bounded local acceptance
+    default: 'true'
+  flush-timeout-seconds:
+    description: Maximum post-step time spent draining queued writes
+    default: '120'
+  pack-target-bytes:
+    description: Target payload bytes per immutable pack
+    default: '67108864'
+  pack-max-objects:
+    description: Maximum Bazel objects per immutable pack
+    default: '256'
+  pack-max-age-seconds:
+    description: Maximum age of the oldest object before sealing a pack
+    default: '8'
+  catalog-refresh-seconds:
+    description: Minimum interval between miss-triggered pack catalog refreshes
+    default: '300'
   remote-timeout-seconds:
     description: Bazel and cache-service request timeout
     default: '30'

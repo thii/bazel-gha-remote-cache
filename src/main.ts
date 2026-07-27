@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import {randomBytes, randomUUID} from 'node:crypto'
+import {createHash, randomBytes, randomUUID} from 'node:crypto'
 import {open} from 'node:fs/promises'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
@@ -64,7 +64,11 @@ function daemonEnvironment(): NodeJS.ProcessEnv {
 
 async function sendDaemonCredentials(
   child: ChildProcess,
-  credentials: {resultsUrl: string; runtimeToken: string}
+  credentials: {
+    resultsUrl: string
+    runtimeToken: string
+    githubToken?: string
+  }
 ): Promise<void> {
   const pipe = child.stdio[3]
   if (!(pipe instanceof Writable)) {
@@ -136,6 +140,7 @@ async function waitForReady(
 
 async function run(): Promise<void> {
   const inputs = parseInputs(name => core.getInput(name))
+  if (inputs.githubToken) core.setSecret(inputs.githubToken)
   // Preserve this policy outside the daemon-owned control files so the post
   // step can still honor it when those files are missing or malformed.
   core.saveState('fail_job_on_cache_error', String(inputs.failJobOnCacheError))
@@ -149,6 +154,15 @@ async function run(): Promise<void> {
     context,
     process.env['ACTIONS_CACHE_MODE']
   )
+  if (
+    inputs.storageMode === 'pack' &&
+    permissions.readable &&
+    !inputs.githubToken
+  ) {
+    throw new Error(
+      'github-token is required for readable packed storage; grant Actions read permission or select storage-mode: object'
+    )
+  }
   const runnerTemp = process.env['RUNNER_TEMP'] ?? ''
   const controlDirectory = await createControlDirectory(runnerTemp)
   let child: ChildProcess | undefined
@@ -157,17 +171,44 @@ async function run(): Promise<void> {
   try {
     const shutdownToken = randomBytes(32).toString('base64url')
     const instanceId = randomUUID()
+    const githubRepository =
+      process.env['GITHUB_REPOSITORY'] ?? 'local/repository'
     const config: DaemonConfig = {
       namespace: inputs.namespace,
+      storageMode: inputs.storageMode,
       port: inputs.port,
       readable: permissions.readable,
       writable: permissions.writable,
       maxObjectSize: inputs.maxObjectSize,
       maxInflightBytes: inputs.maxInflightBytes,
+      maxPendingBytes: inputs.maxPendingBytes,
       uploadConcurrency: inputs.uploadConcurrency,
       downloadConcurrency: inputs.downloadConcurrency,
+      repositoryUploadBudget: inputs.repositoryUploadBudget,
+      expectedWriters: inputs.expectedWriters,
+      uploadBurst: inputs.uploadBurst,
+      writeBack: inputs.writeBack,
+      flushTimeoutSeconds: inputs.flushTimeoutSeconds,
+      packTargetBytes: inputs.packTargetBytes,
+      packMaxObjects: inputs.packMaxObjects,
+      packMaxAgeSeconds: inputs.packMaxAgeSeconds,
+      catalogRefreshSeconds: inputs.catalogRefreshSeconds,
       remoteTimeoutSeconds: inputs.remoteTimeoutSeconds,
       failJobOnCacheError: inputs.failJobOnCacheError,
+      githubApiUrl: process.env['GITHUB_API_URL'] ?? 'https://api.github.com',
+      githubRepository,
+      currentRef: context.ref,
+      ...(context.baseBranch === undefined
+        ? {}
+        : {baseRef: `refs/heads/${context.baseBranch}`}),
+      defaultRef: context.defaultBranch
+        ? `refs/heads/${context.defaultBranch}`
+        : context.ref,
+      runId: process.env['GITHUB_RUN_ID'] ?? '0',
+      jobHash: createHash('sha256')
+        .update(instanceId)
+        .digest('hex')
+        .slice(0, 16),
       controlDirectory,
       shutdownToken,
       instanceId
@@ -189,7 +230,10 @@ async function run(): Promise<void> {
       child.once('error', error => {
         childSpawnError = error
       })
-      await sendDaemonCredentials(child, credentials)
+      await sendDaemonCredentials(child, {
+        ...credentials,
+        ...(inputs.githubToken ? {githubToken: inputs.githubToken} : {})
+      })
     } finally {
       await log.close()
     }

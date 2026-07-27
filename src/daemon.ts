@@ -1,16 +1,28 @@
 import path from 'node:path'
 import {createReadStream} from 'node:fs'
 import {ActionsCacheBackend} from './backend.js'
+import {PackCatalog} from './catalog.js'
 import {validateCacheEnvironment} from './config.js'
 import {CONTROL_FILES, readJsonFile, writeJsonAtomic} from './control.js'
 import {safeErrorMessage, validateDaemonConfig} from './lifecycle.js'
 import {Metrics} from './metrics.js'
 import type {DaemonConfig, DaemonReady} from './model.js'
+import {EntryPacer} from './pacer.js'
+import {
+  packBloomMightContain,
+  packCacheKeyPrefix,
+  tryParsePackCacheKey,
+  type ParsedPackCacheKey
+} from './pack-format.js'
+import {PackReader} from './pack-reader.js'
+import {namespaceHash} from './pack-writer.js'
 import {CacheHttpServer} from './server.js'
+import {WriteBackQueue} from './writeback.js'
 
 interface DaemonCredentials {
   resultsUrl: string
   runtimeToken: string
+  githubToken?: string
 }
 
 async function readCredentialPipe(): Promise<DaemonCredentials> {
@@ -46,7 +58,11 @@ async function readCredentialPipe(): Promise<DaemonCredentials> {
   }
   return {
     resultsUrl: data['resultsUrl'],
-    runtimeToken: data['runtimeToken']
+    runtimeToken: data['runtimeToken'],
+    ...(typeof data['githubToken'] === 'string' &&
+    data['githubToken'].length > 0
+      ? {githubToken: data['githubToken']}
+      : {})
   }
 }
 
@@ -82,11 +98,69 @@ async function run(): Promise<void> {
     config.remoteTimeoutSeconds
   )
 
+  const pacer =
+    config.writable && config.writeBack
+      ? new EntryPacer({
+          repositoryUploadBudget: config.repositoryUploadBudget,
+          expectedWriters: config.expectedWriters,
+          uploadBurst: config.uploadBurst
+        })
+      : undefined
+  const writeBack =
+    pacer === undefined
+      ? undefined
+      : new WriteBackQueue({config, backend, metrics, pacer})
+
+  let packReader: PackReader | undefined
+  if (config.readable && config.storageMode === 'pack') {
+    if (!suppliedCredentials.githubToken) {
+      throw new Error('packed storage requires a GitHub catalog token')
+    }
+    const repositoryParts = config.githubRepository.split('/')
+    const owner = repositoryParts[0]
+    const repository = repositoryParts[1]
+    if (owner === undefined || repository === undefined) {
+      throw new Error('packed storage repository is invalid')
+    }
+    const expectedNamespaceHash = namespaceHash(config.namespace)
+    const catalog = new PackCatalog<ParsedPackCacheKey>({
+      owner,
+      repository,
+      token: suppliedCredentials.githubToken,
+      keyPrefix: packCacheKeyPrefix(expectedNamespaceHash),
+      currentRef: config.currentRef,
+      ...(config.baseRef === undefined ? {} : {baseRef: config.baseRef}),
+      defaultRef: config.defaultRef,
+      codec: {
+        parse: key => {
+          const parsed = tryParsePackCacheKey(key)
+          return parsed?.namespaceHash === expectedNamespaceHash
+            ? parsed
+            : undefined
+        },
+        mightContain: (metadata, kind, digest) =>
+          packBloomMightContain(metadata.bloom, kind, digest)
+      },
+      apiBaseUrl: config.githubApiUrl,
+      refreshIntervalMs: config.catalogRefreshSeconds * 1000,
+      requestTimeoutMs: config.remoteTimeoutSeconds * 1000
+    })
+    packReader = new PackReader({
+      backend,
+      catalog,
+      metrics,
+      directory: path.join(config.controlDirectory, 'pack-downloads'),
+      maxObjectSize: config.maxObjectSize
+    })
+  }
+
   let shutdownPromise: Promise<void> | undefined
   const cacheServer = new CacheHttpServer({
     config,
     backend,
     metrics,
+    ...(writeBack === undefined ? {} : {writeBack}),
+    ...(packReader === undefined ? {} : {packReader}),
     onShutdown: () => {
       requestShutdown()
     }
