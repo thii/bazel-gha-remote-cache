@@ -13,7 +13,10 @@ import type {CacheKind} from './model.js'
  */
 export const PACK_MAGIC = 'BRC2PACK'
 export const PACK_FORMAT_VERSION = 1
-export const PACK_CACHE_VERSION = 'bazel-remote-pack-v1-raw-sha256'
+// SHA-256("bazel-remote-pack-v1-raw-sha256"). Cache v2 clients use a
+// SHA-256 identity for the version field.
+export const PACK_CACHE_VERSION =
+  '0e4776d7b2559968a535effc3462cb6a4d646d333ac10e31ecb38b97e6c2f3af'
 export const PACK_TRAILER_SIZE = 64
 export const PACK_INDEX_HEADER_SIZE = 16
 export const PACK_INDEX_ENTRY_SIZE = 96

@@ -75,7 +75,11 @@ function streamedEntries(): PackIndexEntry[] {
 test('pack constants describe pack-v1 without compression', () => {
   assert.equal(PACK_MAGIC, 'BRC2PACK')
   assert.equal(PACK_FORMAT_VERSION, 1)
-  assert.equal(PACK_CACHE_VERSION, 'bazel-remote-pack-v1-raw-sha256')
+  assert.equal(
+    PACK_CACHE_VERSION,
+    '0e4776d7b2559968a535effc3462cb6a4d646d333ac10e31ecb38b97e6c2f3af'
+  )
+  assert.match(PACK_CACHE_VERSION, /^[0-9a-f]{64}$/)
   assert.equal(PACK_TRAILER_SIZE, 64)
   assert.equal(PACK_INDEX_HEADER_SIZE, 16)
   assert.equal(PACK_INDEX_ENTRY_SIZE, 96)
