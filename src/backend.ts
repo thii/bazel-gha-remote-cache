@@ -222,7 +222,7 @@ class TwirpJsonTransport {
             Accept: 'application/json',
             Authorization: `Bearer ${this.token}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'bazel-gha-remote-cache/0.0.2'
+            'User-Agent': 'bazel-gha-remote-cache/0.0.3'
           },
           body: JSON.stringify(data),
           redirect: 'error',

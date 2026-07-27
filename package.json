@@ -1,6 +1,6 @@
 {
   "name": "bazel-gha-remote-cache",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "type": "module",
   "description": "A loopback Bazel remote-cache adapter backed by GitHub Actions Cache v2",
