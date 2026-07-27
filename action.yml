@@ -4,7 +4,7 @@ author: bazel-gha-remote-cache contributors
 
 inputs:
   namespace:
-    description: Logical cache namespace and schema generation
+    description: Optional logical cache partition; changing it forces misses
     default: bazel-v1
   mode:
     description: auto, read-only, or read-write

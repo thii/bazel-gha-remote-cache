@@ -57,9 +57,12 @@ anything left unflushed.
 
 ## Usage
 
-Pin the action to a reviewed full commit SHA. The namespace should include the
-operating system, architecture, Bazel/toolchain versions, and a schema
-generation so incompatible results cannot collide.
+Pin the action to a reviewed full commit SHA. The default namespace is suitable
+for normal Bazel caches: Bazel supplies the AC and CAS digests, while the
+adapter's key and Cache v2 versions isolate its storage formats. Set a different
+namespace only when you deliberately want a separate cache population or a
+manual cold-cache boundary. A namespace is not a substitute for hermetic,
+correctly declared Bazel actions and is not an authorization boundary.
 
 ```yaml
 name: Bazel CI
@@ -88,7 +91,6 @@ jobs:
         id: cache
         uses: thii/bazel-gha-remote-cache@<pinned-sha>
         with:
-          namespace: linux-amd64-bazel8-v2
           storage-mode: pack
           github-token: ${{ github.token }}
           repository-upload-budget: '120'
@@ -151,8 +153,8 @@ The HTTP server binds only to `127.0.0.1`, and shutdown requires a private
 bearer token stored in the runner's temporary control directory.
 
 Treat restored bytes as untrusted input. Do not cache secrets or signing
-material, keep untrusted workflows read-only, and use namespaces for
-compatibility separation rather than authorization.
+material, keep untrusted workflows read-only, and use separate namespaces only
+for intentional cache partitioning, never authorization.
 
 ## Storage modes
 
@@ -170,8 +172,9 @@ range reads only the payload. Indexes and signed URLs are cached locally, and
 cold concurrent index loads are coalesced.
 
 During migration, reads check local data, then pack-v1, then the legacy exact
-object key. Changing `namespace` is still recommended when the Bazel cache
-schema or toolchain compatibility changes.
+object key. Object and pack storage revisions have separate adapter-managed key
+and Cache v2 versions. Changing `namespace` simply forces a new logical cache
+partition.
 
 ## Rate limiting
 
@@ -199,7 +202,7 @@ does not enforce an entries-per-minute rate by itself.
 
 | Input                      | Default               | Meaning                                                |
 | -------------------------- | --------------------- | ------------------------------------------------------ |
-| `namespace`                | `bazel-v1`            | Logical compatibility namespace                        |
+| `namespace`                | `bazel-v1`            | Optional logical partition; changing it forces misses  |
 | `mode`                     | `auto`                | `auto`, `read-only`, or `read-write`                   |
 | `storage-mode`             | `pack`                | `pack` or legacy `object` storage                      |
 | `github-token`             | `${{ github.token }}` | Token used only to list pack cache entries             |

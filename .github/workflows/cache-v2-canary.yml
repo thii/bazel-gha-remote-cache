@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   upload:
-    name: Upload raw CAS object
+    name: Upload mixed CAS and AC records
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -38,12 +38,13 @@ jobs:
           max-inflight-bytes: '1048576'
           max-pending-bytes: '1048576'
           pack-target-bytes: '1048576'
-          pack-max-age-seconds: '1'
+          pack-max-objects: '2'
+          pack-max-age-seconds: '300'
           upload-concurrency: '1'
           download-concurrency: '1'
           fail-job-on-cache-error: 'true'
 
-      - name: Upload raw bytes
+      - name: Upload CAS then AC bytes
         id: put
         shell: bash
         env:
@@ -56,10 +57,20 @@ jobs:
           test "$CACHE_READABLE" = true
           test "$CACHE_WRITABLE" = true
 
-          payload="$RUNNER_TEMP/cache-v2-canary.bin"
+          cas_payload="$RUNNER_TEMP/cache-v2-canary.cas"
+          action_key="$RUNNER_TEMP/cache-v2-canary.action-key"
+          action_payload="$RUNNER_TEMP/cache-v2-canary.ac"
           printf 'bazel-gha-remote-cache canary\nrun=%s\nattempt=%s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$payload"
-          digest="$(sha256sum "$payload" | cut -d ' ' -f 1)"
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$cas_payload"
+          printf 'bazel-gha-remote-cache action key\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$action_key"
+          # build.bazel.remote.execution.v2.ActionResult { exit_code: 1 }
+          printf '\040\001' >"$action_payload"
+
+          cas_digest="$(sha256sum "$cas_payload" | cut -d ' ' -f 1)"
+          action_digest="$(sha256sum "$action_key" | cut -d ' ' -f 1)"
+          action_body_digest="$(sha256sum "$action_payload" | cut -d ' ' -f 1)"
+          test "$action_digest" != "$action_body_digest"
 
           curl \
             --silent \
@@ -68,13 +79,23 @@ jobs:
             --max-time 60 \
             --request PUT \
             --header 'Content-Type: application/octet-stream' \
-            --data-binary "@$payload" \
-            "${CACHE_URL%/}/cas/$digest"
+            --data-binary "@$cas_payload" \
+            "${CACHE_URL%/}/cas/$cas_digest"
+
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --max-time 60 \
+            --request PUT \
+            --header 'Content-Type: application/octet-stream' \
+            --data-binary "@$action_payload" \
+            "${CACHE_URL%/}/ac/$action_digest"
 
           echo "accepted_at=$(date -u +%s)" >>"$GITHUB_OUTPUT"
 
   download:
-    name: Download raw CAS object
+    name: Verify one mixed pack from a fresh runner
     needs: upload
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -100,13 +121,15 @@ jobs:
           download-concurrency: '1'
           fail-job-on-cache-error: 'true'
 
-      - name: Download and verify raw bytes
+      - name: Download and verify AC and CAS bytes
         shell: bash
         env:
           CACHE_URL: ${{ steps.cache.outputs.url }}
           CACHE_READABLE: ${{ steps.cache.outputs.readable }}
           CACHE_WRITABLE: ${{ steps.cache.outputs.writable }}
           ACCEPTED_AT: ${{ needs.upload.outputs.accepted_at }}
+          CACHE_NAMESPACE: canary-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -114,36 +137,94 @@ jobs:
           test "$CACHE_WRITABLE" = false
           [[ "$ACCEPTED_AT" =~ ^[0-9]+$ ]]
 
-          expected="$RUNNER_TEMP/cache-v2-canary.expected"
-          actual="$RUNNER_TEMP/cache-v2-canary.actual"
+          expected_cas="$RUNNER_TEMP/cache-v2-canary.expected.cas"
+          action_key="$RUNNER_TEMP/cache-v2-canary.action-key"
+          expected_ac="$RUNNER_TEMP/cache-v2-canary.expected.ac"
+          actual_cas="$RUNNER_TEMP/cache-v2-canary.actual.cas"
+          actual_ac="$RUNNER_TEMP/cache-v2-canary.actual.ac"
           printf 'bazel-gha-remote-cache canary\nrun=%s\nattempt=%s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$expected"
-          digest="$(sha256sum "$expected" | cut -d ' ' -f 1)"
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$expected_cas"
+          printf 'bazel-gha-remote-cache action key\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$action_key"
+          # build.bazel.remote.execution.v2.ActionResult { exit_code: 1 }
+          printf '\040\001' >"$expected_ac"
 
+          cas_digest="$(sha256sum "$expected_cas" | cut -d ' ' -f 1)"
+          action_digest="$(sha256sum "$action_key" | cut -d ' ' -f 1)"
+          action_body_digest="$(sha256sum "$expected_ac" | cut -d ' ' -f 1)"
+          test "$action_digest" != "$action_body_digest"
+
+          ac_ready=0
+          cas_ready=0
           for attempt in {1..12}; do
-            if curl \
+            if [[ "$ac_ready" -eq 0 ]] && curl \
               --silent \
               --show-error \
               --fail \
               --max-time 60 \
-              --output "$actual" \
-              "${CACHE_URL%/}/cas/$digest"; then
+              --output "$actual_ac" \
+              "${CACHE_URL%/}/ac/$action_digest"; then
+              ac_ready=1
+            fi
+            if [[ "$cas_ready" -eq 0 ]] && curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 60 \
+              --output "$actual_cas" \
+              "${CACHE_URL%/}/cas/$cas_digest"; then
+              cas_ready=1
+            fi
+            if [[ "$ac_ready" -eq 1 && "$cas_ready" -eq 1 ]]; then
               break
             fi
 
             if [[ "$attempt" -eq 12 ]]; then
-              echo 'The finalized Cache v2 object was not visible after 12 attempts.' >&2
+              echo 'The finalized mixed pack was not readable after 12 attempts.' >&2
               exit 1
             fi
             sleep 5
           done
 
-          cmp --silent "$expected" "$actual"
+          cmp --silent "$expected_ac" "$actual_ac"
+          cmp --silent "$expected_cas" "$actual_cas"
+
+          namespace_hash="$(printf '%s' "$CACHE_NAMESPACE" | sha256sum | cut -c1-16)"
+          pack_prefix="brc2-${namespace_hash}-pack-"
+          catalog="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/caches" \
+            -f key="$pack_prefix" \
+            -f ref="$GITHUB_REF" \
+            -f sort=created_at \
+            -f direction=desc \
+            -F per_page=100)"
+          pack_count="$(jq \
+            --arg prefix "$pack_prefix" \
+            '[.actions_caches[] | select(.key | startswith($prefix))] | length' \
+            <<<"$catalog")"
+          test "$pack_count" -eq 1
+
+          pack_version="$(jq -er \
+            --arg prefix "$pack_prefix" \
+            '.actions_caches[] | select(.key | startswith($prefix)) | .version' \
+            <<<"$catalog")"
+          test "$pack_version" = \
+            '0e4776d7b2559968a535effc3462cb6a4d646d333ac10e31ecb38b97e6c2f3af'
+
+          pack_bytes="$(jq -er \
+            --arg prefix "$pack_prefix" \
+            '.actions_caches[] | select(.key | startswith($prefix)) | .size_in_bytes' \
+            <<<"$catalog")"
+          cas_bytes="$(wc -c <"$expected_cas")"
+          ac_bytes="$(wc -c <"$expected_ac")"
+          expected_pack_bytes="$((cas_bytes + ac_bytes + 16 + 2 * 96 + 64))"
+          test "$pack_bytes" -eq "$expected_pack_bytes"
 
           verified_at="$(date -u +%s)"
           latency_seconds="$((verified_at - ACCEPTED_AT))"
           {
             echo '### Cache v2 cross-job canary'
             echo
-            echo "Verified the exact packed CAS bytes ${latency_seconds}s after local acceptance."
+            echo "Verified 2 Bazel objects (CAS + AC) in exactly 1 GitHub Cache v2 pack entry ${latency_seconds}s after local acceptance."
           } >>"$GITHUB_STEP_SUMMARY"

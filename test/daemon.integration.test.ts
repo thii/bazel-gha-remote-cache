@@ -79,7 +79,7 @@ async function waitForExit(child: ChildProcess): Promise<number | null> {
   })
 }
 
-test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', async t => {
+test('daemon finalizes one mixed CAS/AC pack and preserves both payloads', async t => {
   const runtimeToken = `runtime-${randomBytes(16).toString('hex')}`
   const sasSignature = `sas-${randomBytes(16).toString('hex')}`
   const requests: CapturedRequest[] = []
@@ -191,8 +191,8 @@ test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', 
     writeBack: true,
     flushTimeoutSeconds: 5,
     packTargetBytes: 1024 * 1024,
-    packMaxObjects: 256,
-    packMaxAgeSeconds: 1,
+    packMaxObjects: 2,
+    packMaxAgeSeconds: 300,
     catalogRefreshSeconds: 15,
     remoteTimeoutSeconds: 5,
     failJobOnCacheError: true,
@@ -256,17 +256,35 @@ test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', 
   )
   assert.equal(ready.instanceId, config.instanceId)
 
-  const payload = Buffer.from([0, 10, 0, 255, 1, 2, 3])
-  const objectDigest = createHash('sha256').update(payload).digest('hex')
-  const put = await fetch(`${ready.url}/cache/cas/${objectDigest}`, {
-    method: 'PUT',
-    body: payload
-  })
-  assert.equal(put.status, 204)
+  const casPayload = Buffer.from([0, 10, 0, 255, 1, 2, 3])
+  const casDigest = createHash('sha256').update(casPayload).digest('hex')
+  // build.bazel.remote.execution.v2.ActionResult { exit_code: 1 }
+  const actionPayload = Buffer.from([0x20, 0x01])
+  const actionDigest = createHash('sha256')
+    .update('integration action key')
+    .digest('hex')
+  assert.notEqual(
+    actionDigest,
+    createHash('sha256').update(actionPayload).digest('hex')
+  )
 
-  const get = await fetch(`${ready.url}/cache/cas/${objectDigest}`)
-  assert.equal(get.status, 200)
-  assert.deepEqual(Buffer.from(await get.arrayBuffer()), payload)
+  const casPut = await fetch(`${ready.url}/cache/cas/${casDigest}`, {
+    method: 'PUT',
+    body: casPayload
+  })
+  assert.equal(casPut.status, 204)
+  const actionPut = await fetch(`${ready.url}/cache/ac/${actionDigest}`, {
+    method: 'PUT',
+    body: actionPayload
+  })
+  assert.equal(actionPut.status, 204)
+
+  const actionGet = await fetch(`${ready.url}/cache/ac/${actionDigest}`)
+  assert.equal(actionGet.status, 200)
+  assert.deepEqual(Buffer.from(await actionGet.arrayBuffer()), actionPayload)
+  const casGet = await fetch(`${ready.url}/cache/cas/${casDigest}`)
+  assert.equal(casGet.status, 200)
+  assert.deepEqual(Buffer.from(await casGet.arrayBuffer()), casPayload)
 
   const shutdown = await fetch(`${ready.url}/shutdown`, {
     method: 'POST',
@@ -285,10 +303,12 @@ test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', 
     )
   )
   assert.equal(stats.writes.cas.successes, 1)
+  assert.equal(stats.writes.ac.successes, 1)
   assert.equal(stats.reads.cas.hits, 1)
+  assert.equal(stats.reads.ac.hits, 1)
   assert.equal(stats.backend.errors, 0)
-  assert.equal(stats.writeBack.acceptedObjects, 1)
-  assert.equal(stats.writeBack.packedObjects, 1)
+  assert.equal(stats.writeBack.acceptedObjects, 2)
+  assert.equal(stats.writeBack.packedObjects, 2)
   assert.equal(stats.writeBack.packsFinalized, 1)
   assert.equal(stats.writeBack.remainingObjects, 0)
 
@@ -297,14 +317,24 @@ test('daemon accepts locally, finalizes a pack, and preserves exact CAS bytes', 
   assert.ok(packKey?.startsWith('brc2-'))
   assert.ok(packBytes)
   const parsedPack = parsePack(packBytes)
-  const entry = findPackIndexEntry(parsedPack.entries, 'cas', objectDigest)
-  assert.ok(entry)
+  assert.equal(parsedPack.entries.length, 2)
+  const casEntry = findPackIndexEntry(parsedPack.entries, 'cas', casDigest)
+  assert.ok(casEntry)
   assert.deepEqual(
     packBytes.subarray(
-      Number(entry.offset),
-      Number(entry.offset + entry.length)
+      Number(casEntry.offset),
+      Number(casEntry.offset + casEntry.length)
     ),
-    payload
+    casPayload
+  )
+  const actionEntry = findPackIndexEntry(parsedPack.entries, 'ac', actionDigest)
+  assert.ok(actionEntry)
+  assert.deepEqual(
+    packBytes.subarray(
+      Number(actionEntry.offset),
+      Number(actionEntry.offset + actionEntry.length)
+    ),
+    actionPayload
   )
 
   const finalizedRequest = requests.find(request =>
