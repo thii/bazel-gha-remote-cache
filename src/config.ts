@@ -1,5 +1,6 @@
 import {readFile} from 'node:fs/promises'
 import {URL} from 'node:url'
+import type {DiagnosticUploadMode} from './diagnostics.js'
 import type {EventContext, RequestedMode, StorageMode} from './model.js'
 
 export interface ParsedInputs {
@@ -24,6 +25,8 @@ export interface ParsedInputs {
   catalogRefreshSeconds: number
   remoteTimeoutSeconds: number
   failJobOnCacheError: boolean
+  uploadDiagnostics: DiagnosticUploadMode
+  diagnosticsRetentionDays: number
 }
 
 export interface EffectivePermissions {
@@ -83,6 +86,16 @@ export function parseInputs(reader: InputReader): ParsedInputs {
   const storageMode = (reader('storage-mode') || 'pack').toLowerCase()
   if (storageMode !== 'object' && storageMode !== 'pack') {
     throw new Error('storage-mode must be object or pack')
+  }
+  const uploadDiagnostics = (
+    reader('upload-diagnostics') || 'on-error'
+  ).toLowerCase()
+  if (
+    uploadDiagnostics !== 'on-error' &&
+    uploadDiagnostics !== 'always' &&
+    uploadDiagnostics !== 'never'
+  ) {
+    throw new Error('upload-diagnostics must be on-error, always, or never')
   }
   const writeBack = booleanInput(reader, 'write-back', 'true')
   if (storageMode === 'pack' && !writeBack) {
@@ -188,6 +201,14 @@ export function parseInputs(reader: InputReader): ParsedInputs {
       reader,
       'fail-job-on-cache-error',
       'false'
+    ),
+    uploadDiagnostics,
+    diagnosticsRetentionDays: integerInput(
+      reader,
+      'diagnostics-retention-days',
+      '7',
+      1,
+      90
     )
   }
 }

@@ -67,6 +67,12 @@ inputs:
   fail-job-on-cache-error:
     description: Fail the post step when the adapter observed a backend error
     default: 'false'
+  upload-diagnostics:
+    description: Upload sanitized diagnostics on-error, always, or never
+    default: on-error
+  diagnostics-retention-days:
+    description: Retention period for diagnostic artifacts
+    default: '7'
 
 outputs:
   url:
@@ -77,6 +83,8 @@ outputs:
     description: Whether the daemon performs reads
   bazelrc:
     description: Generated Bazel rc file
+  diagnostics-artifact-name:
+    description: Exact artifact name used if diagnostics are uploaded
 
 runs:
   using: node24

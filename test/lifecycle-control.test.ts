@@ -218,6 +218,10 @@ test('validateMetrics rejects missing or malformed nested control data', () => {
       value: {...snapshot, casWriteFailed: 'false'}
     },
     {
+      label: 'invalid diagnostic journal status',
+      value: {...snapshot, diagnosticJournalFailed: 'false'}
+    },
+    {
       label: 'invalid optional stop timestamp',
       value: {...snapshot, stoppedAt: 123}
     }
@@ -248,6 +252,9 @@ test('metricsHaveCacheErrors enforces strict post-step health', () => {
     },
     (stats: typeof clean) => {
       stats.backend.rateLimited = 1
+    },
+    (stats: typeof clean) => {
+      stats.diagnosticJournalFailed = true
     },
     (stats: typeof clean) => {
       stats.reads.ac.errors = 1

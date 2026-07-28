@@ -13,6 +13,7 @@ import type {ReadableStream as NodeReadableStream} from 'node:stream/web'
 import type {AddressInfo} from 'node:net'
 import {BackendError, type CacheBackend, type CacheLookup} from './backend.js'
 import {CapacityLimiter} from './concurrency.js'
+import type {DiagnosticJournal} from './diagnostics.js'
 import {Metrics} from './metrics.js'
 import type {PackReader} from './pack-reader.js'
 import type {WriteBackQueue} from './writeback.js'
@@ -223,6 +224,7 @@ export interface CacheServerOptions {
   config: DaemonConfig
   backend: CacheBackend
   metrics: Metrics
+  diagnostics?: DiagnosticJournal
   onShutdown: () => void
   writeBack?: WriteBackQueue
   packReader?: PackReader
@@ -433,10 +435,19 @@ export class CacheHttpServer {
           writeEmpty(response, 403)
           return
         }
-        const rejectUpload = (status: number): void => {
+        const rejectUpload = (status: number, reason: string): void => {
           this.options.metrics.request('put')
           this.options.metrics.request('rejected')
           this.options.metrics.write(parsed.kind, 'error', 0, 0)
+          this.options.diagnostics?.record(
+            {
+              area: 'http',
+              operation: 'expect',
+              kind: parsed.kind,
+              digest: parsed.digest
+            },
+            new RequestError(status, reason)
+          )
           if (parsed.kind === 'cas' && this.options.writeBack === undefined) {
             this.integrity.failCas()
             this.options.metrics.setCasWriteFailed()
@@ -445,21 +456,29 @@ export class CacheHttpServer {
         }
         const encoding = request.headers['content-encoding']?.toLowerCase()
         if (encoding !== undefined && encoding !== 'identity') {
-          rejectUpload(415)
+          rejectUpload(415, 'content encoding is not supported')
           return
         }
         const length = requestContentLength(request)
         if (length === undefined) {
-          rejectUpload(400)
+          rejectUpload(400, 'content length is missing or invalid')
           return
         }
         if (length > this.options.config.maxObjectSize) {
-          rejectUpload(413)
+          rejectUpload(413, 'cache object exceeds max-object-size')
           return
         }
         response.writeContinue()
         void this.dispatch(request, response)
       } catch (error) {
+        this.options.diagnostics?.record(
+          {
+            area: 'http',
+            operation: 'expect',
+            ...(parseObjectPath(request.url) ?? {})
+          },
+          error
+        )
         const status = error instanceof RequestError ? error.statusCode : 400
         const parsed = parseObjectPath(request.url)
         if (
@@ -661,6 +680,15 @@ export class CacheHttpServer {
 
       writeEmpty(response, 405, {Allow: 'GET, PUT'})
     } catch (error) {
+      const object = parseObjectPath(request.url)
+      this.options.diagnostics?.record(
+        {
+          area: 'http',
+          operation: (request.method ?? 'unknown').toLowerCase(),
+          ...(object ?? {})
+        },
+        error
+      )
       this.respondError(response, error)
     }
   }
@@ -703,6 +731,15 @@ export class CacheHttpServer {
           Date.now() - startedAt
         )
       } catch (error) {
+        this.options.diagnostics?.record(
+          {
+            area: 'local-read',
+            operation: 'pending',
+            kind: object.kind,
+            digest: object.digest
+          },
+          error
+        )
         if (!response.destroyed) {
           response.destroy(error instanceof Error ? error : undefined)
         }
@@ -726,6 +763,15 @@ export class CacheHttpServer {
     try {
       lease = this.readCircuit.enter()
     } catch (error) {
+      this.options.diagnostics?.record(
+        {
+          area: 'circuit',
+          operation: 'read',
+          kind: object.kind,
+          digest: object.digest
+        },
+        error
+      )
       this.options.metrics.read(object.kind, 'error', 0, Date.now() - startedAt)
       if (object.kind === 'ac') {
         writeEmpty(response, 404)
@@ -747,6 +793,15 @@ export class CacheHttpServer {
         )
       } catch (error) {
         if (controller.signal.aborted) {
+          this.options.diagnostics?.record(
+            {
+              area: 'http',
+              operation: 'get',
+              kind: object.kind,
+              digest: object.digest
+            },
+            new RequestError(499, 'request aborted')
+          )
           this.readCircuit.complete(lease)
           this.options.metrics.read(
             object.kind,
@@ -765,6 +820,15 @@ export class CacheHttpServer {
             Date.now() - startedAt
           )
           if (object.kind === 'ac') {
+            this.options.diagnostics?.record(
+              {
+                area: 'http',
+                operation: 'get',
+                kind: object.kind,
+                digest: object.digest
+              },
+              this.backendRequestError(error)
+            )
             writeEmpty(response, 404)
             return
           }
@@ -790,6 +854,15 @@ export class CacheHttpServer {
           )
           this.readCircuit.complete(lease)
         } catch (error) {
+          this.options.diagnostics?.record(
+            {
+              area: 'local-read',
+              operation: 'pack',
+              kind: object.kind,
+              digest: object.digest
+            },
+            error
+          )
           this.readCircuit.complete(lease)
           this.options.metrics.read(
             object.kind,
@@ -821,8 +894,28 @@ export class CacheHttpServer {
       }
       this.handleRateLimit(error, this.readCircuit)
       this.options.metrics.read(object.kind, 'error', 0, Date.now() - startedAt)
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted) {
+        this.options.diagnostics?.record(
+          {
+            area: 'http',
+            operation: 'get',
+            kind: object.kind,
+            digest: object.digest
+          },
+          new RequestError(499, 'request aborted')
+        )
+        return
+      }
       if (object.kind === 'ac') {
+        this.options.diagnostics?.record(
+          {
+            area: 'http',
+            operation: 'get',
+            kind: object.kind,
+            digest: object.digest
+          },
+          this.backendRequestError(error)
+        )
         writeEmpty(response, 404)
         return
       }
@@ -830,6 +923,15 @@ export class CacheHttpServer {
     }
 
     if (controller.signal.aborted) {
+      this.options.diagnostics?.record(
+        {
+          area: 'http',
+          operation: 'get',
+          kind: object.kind,
+          digest: object.digest
+        },
+        new RequestError(499, 'request aborted')
+      )
       this.readCircuit.complete(lease)
       this.options.metrics.read(object.kind, 'error', 0, Date.now() - startedAt)
       return
@@ -903,7 +1005,19 @@ export class CacheHttpServer {
         Date.now() - startedAt
       )
     } catch (error) {
+      const recordHttpError = (): void => {
+        this.options.diagnostics?.record(
+          {
+            area: 'http',
+            operation: 'get',
+            kind: object.kind,
+            digest: object.digest
+          },
+          error
+        )
+      }
       if (response.headersSent) {
+        recordHttpError()
         response.destroy(error instanceof Error ? error : undefined)
         this.readCircuit.complete(lease)
         this.options.metrics.read(
@@ -925,6 +1039,7 @@ export class CacheHttpServer {
         Date.now() - startedAt
       )
       if (object.kind === 'ac') {
+        recordHttpError()
         writeEmpty(response, 404)
         return
       }
@@ -1296,6 +1411,14 @@ export class CacheHttpServer {
       return await operation()
     } catch (error) {
       this.options.metrics.backend('errors')
+      const operation = {
+        lookups: 'lookup',
+        reservations: 'reserve',
+        uploads: 'upload',
+        finalizations: 'finalize',
+        downloads: 'download'
+      }[counter]
+      this.options.diagnostics?.record({area: 'backend', operation}, error)
       if (error instanceof BackendError && error.rateLimited) {
         this.options.metrics.backend('rateLimited')
       }

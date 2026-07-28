@@ -17,6 +17,7 @@ export const CONTROL_FILES = {
   config: 'daemon-config.json',
   ready: 'ready.json',
   stats: 'stats.json',
+  diagnostics: 'errors.ndjson',
   log: 'daemon.log',
   bazelrc: 'bazelrc'
 } as const

@@ -37,7 +37,9 @@ test('parseInputs applies the documented defaults', () => {
     packMaxAgeSeconds: 8,
     catalogRefreshSeconds: 300,
     remoteTimeoutSeconds: 30,
-    failJobOnCacheError: false
+    failJobOnCacheError: false,
+    uploadDiagnostics: 'on-error',
+    diagnosticsRetentionDays: 7
   })
 })
 
@@ -65,7 +67,9 @@ test('parseInputs accepts valid explicit values and normalizes enum inputs', () 
         'pack-max-age-seconds': '10',
         'catalog-refresh-seconds': '20',
         'remote-timeout-seconds': '3600',
-        'fail-job-on-cache-error': 'TRUE'
+        'fail-job-on-cache-error': 'TRUE',
+        'upload-diagnostics': 'ALWAYS',
+        'diagnostics-retention-days': '30'
       })
     ),
     {
@@ -89,7 +93,9 @@ test('parseInputs accepts valid explicit values and normalizes enum inputs', () 
       packMaxAgeSeconds: 10,
       catalogRefreshSeconds: 20,
       remoteTimeoutSeconds: 3600,
-      failJobOnCacheError: true
+      failJobOnCacheError: true,
+      uploadDiagnostics: 'always',
+      diagnosticsRetentionDays: 30
     }
   )
 })
@@ -174,6 +180,16 @@ test('parseInputs rejects malformed and out-of-policy inputs', () => {
       label: 'boolean syntax',
       values: {'fail-job-on-cache-error': 'yes'},
       error: /fail-job-on-cache-error must be true or false/
+    },
+    {
+      label: 'diagnostics mode',
+      values: {'upload-diagnostics': 'sometimes'},
+      error: /upload-diagnostics must be on-error, always, or never/
+    },
+    {
+      label: 'diagnostics retention',
+      values: {'diagnostics-retention-days': '91'},
+      error: /diagnostics-retention-days must be between 1 and 90/
     }
   ]
 

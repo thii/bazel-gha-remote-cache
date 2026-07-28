@@ -116,6 +116,7 @@ export interface MetricsSnapshot {
     rangeBytesDownloaded: number
   }
   integrityFailures: number
+  diagnosticJournalFailed: boolean
   casWriteFailed: boolean
   writeCircuitOpen: boolean
   readCircuitOpen: boolean

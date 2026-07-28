@@ -1,5 +1,6 @@
 import {BlockBlobClient} from '@azure/storage-blob'
 import {AsyncLocalStorage} from 'node:async_hooks'
+import {ACTION_VERSION} from './version.js'
 import {CacheServiceClientJSON} from './vendor/actions-toolkit/generated/results/api/v1/cache.twirp-client.js'
 import type {
   CreateCacheEntryResponse,
@@ -222,7 +223,7 @@ class TwirpJsonTransport {
             Accept: 'application/json',
             Authorization: `Bearer ${this.token}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'bazel-gha-remote-cache/0.0.3'
+            'User-Agent': `bazel-gha-remote-cache/${ACTION_VERSION}`
           },
           body: JSON.stringify(data),
           redirect: 'error',

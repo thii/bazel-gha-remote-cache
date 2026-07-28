@@ -200,29 +200,31 @@ does not enforce an entries-per-minute rate by itself.
 
 ## Inputs
 
-| Input                      | Default               | Meaning                                                |
-| -------------------------- | --------------------- | ------------------------------------------------------ |
-| `namespace`                | `bazel-v1`            | Optional logical partition; changing it forces misses  |
-| `mode`                     | `auto`                | `auto`, `read-only`, or `read-write`                   |
-| `storage-mode`             | `pack`                | `pack` or legacy `object` storage                      |
-| `github-token`             | `${{ github.token }}` | Token used only to list pack cache entries             |
-| `port`                     | `0`                   | Loopback port; `0` selects an available port           |
-| `max-object-size`          | `2147483648`          | Maximum object bytes (2 GiB)                           |
-| `max-inflight-bytes`       | `4294967296`          | Maximum bytes being request-spooled (4 GiB)            |
-| `max-pending-bytes`        | `4294967296`          | Queued and retained local source-data budget (4 GiB)   |
-| `upload-concurrency`       | `4`                   | Legacy synchronous upload concurrency                  |
-| `download-concurrency`     | `16`                  | Maximum concurrent remote read operations              |
-| `repository-upload-budget` | `120`                 | Desired repository-wide entries/minute budget          |
-| `expected-writers`         | `1`                   | Simultaneously writable adapter jobs                   |
-| `upload-burst`             | `2`                   | Initial per-daemon entry-creation burst                |
-| `write-back`               | `true`                | Acknowledge after durable local acceptance             |
-| `flush-timeout-seconds`    | `120`                 | Bounded post-step queue drain                          |
-| `pack-target-bytes`        | `67108864`            | Target pack payload bytes (64 MiB)                     |
-| `pack-max-objects`         | `256`                 | Maximum records per pack                               |
-| `pack-max-age-seconds`     | `8`                   | Oldest-record age that seals a pack                    |
-| `catalog-refresh-seconds`  | `300`                 | Minimum interval between miss-triggered REST refreshes |
-| `remote-timeout-seconds`   | `30`                  | Bazel and remote request timeout                       |
-| `fail-job-on-cache-error`  | `false`               | Fail post step after cache errors or unflushed data    |
+| Input                        | Default               | Meaning                                                |
+| ---------------------------- | --------------------- | ------------------------------------------------------ |
+| `namespace`                  | `bazel-v1`            | Optional logical partition; changing it forces misses  |
+| `mode`                       | `auto`                | `auto`, `read-only`, or `read-write`                   |
+| `storage-mode`               | `pack`                | `pack` or legacy `object` storage                      |
+| `github-token`               | `${{ github.token }}` | Token used only to list pack cache entries             |
+| `port`                       | `0`                   | Loopback port; `0` selects an available port           |
+| `max-object-size`            | `2147483648`          | Maximum object bytes (2 GiB)                           |
+| `max-inflight-bytes`         | `4294967296`          | Maximum bytes being request-spooled (4 GiB)            |
+| `max-pending-bytes`          | `4294967296`          | Queued and retained local source-data budget (4 GiB)   |
+| `upload-concurrency`         | `4`                   | Legacy synchronous upload concurrency                  |
+| `download-concurrency`       | `16`                  | Maximum concurrent remote read operations              |
+| `repository-upload-budget`   | `120`                 | Desired repository-wide entries/minute budget          |
+| `expected-writers`           | `1`                   | Simultaneously writable adapter jobs                   |
+| `upload-burst`               | `2`                   | Initial per-daemon entry-creation burst                |
+| `write-back`                 | `true`                | Acknowledge after durable local acceptance             |
+| `flush-timeout-seconds`      | `120`                 | Bounded post-step queue drain                          |
+| `pack-target-bytes`          | `67108864`            | Target pack payload bytes (64 MiB)                     |
+| `pack-max-objects`           | `256`                 | Maximum records per pack                               |
+| `pack-max-age-seconds`       | `8`                   | Oldest-record age that seals a pack                    |
+| `catalog-refresh-seconds`    | `300`                 | Minimum interval between miss-triggered REST refreshes |
+| `remote-timeout-seconds`     | `30`                  | Bazel and remote request timeout                       |
+| `fail-job-on-cache-error`    | `false`               | Fail post step after cache errors or unflushed data    |
+| `upload-diagnostics`         | `on-error`            | Upload sanitized diagnostics: on-error, always, never  |
+| `diagnostics-retention-days` | `7`                   | Diagnostic artifact retention (1–90 days)              |
 
 `max-inflight-bytes` and `max-pending-bytes` must each be at least
 `max-object-size`; `pack-target-bytes` cannot exceed `max-pending-bytes`.
@@ -232,12 +234,13 @@ runner disk use can be higher than `max-pending-bytes`.
 
 ## Outputs
 
-| Output     | Meaning                                      |
-| ---------- | -------------------------------------------- |
-| `url`      | Loopback remote-cache URL including `/cache` |
-| `readable` | Whether remote reads are enabled             |
-| `writable` | Whether PUTs are enabled after event policy  |
-| `bazelrc`  | Generated temporary Bazel rc path            |
+| Output                      | Meaning                                      |
+| --------------------------- | -------------------------------------------- |
+| `url`                       | Loopback remote-cache URL including `/cache` |
+| `readable`                  | Whether remote reads are enabled             |
+| `writable`                  | Whether PUTs are enabled after event policy  |
+| `bazelrc`                   | Generated temporary Bazel rc path            |
+| `diagnostics-artifact-name` | Exact name used for a diagnostics artifact   |
 
 ## Failure behavior and metrics
 
@@ -254,6 +257,22 @@ reservation rates, pacing sleep, rate-limit responses by operation, catalog
 refreshes, Bloom candidates and false positives, and range bytes downloaded. A
 low observed reservation rate alongside a rate-limit response is evidence that
 another repository job or cache consumer is using the shared quota.
+
+When cache or lifecycle errors occur, `upload-diagnostics: on-error` uploads a
+short-retention artifact named
+`bazel-gha-remote-cache-diagnostics-<run>-<job>`. Its single
+`diagnostics.json` file contains validated metrics and a bounded structured
+error journal with timestamps, operation phases, HTTP status, retry and rate
+limit classification, and client-abort classification. The action captures the
+diagnostic snapshot before post-step cleanup, so drain and shutdown failures
+are retained.
+
+The private daemon control directory is never uploaded. Diagnostic artifacts
+exclude credentials, signed URLs, configuration files, Bazel object payloads,
+packs, manifests, local paths, and full object digests. Diagnostic upload
+failure produces a warning but does not change the build result or prevent
+cleanup. Set `upload-diagnostics: always` when investigating a run without
+recorded cache errors, or `never` to disable artifacts entirely.
 
 ## Development
 

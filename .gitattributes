@@ -1,0 +1,2 @@
+# Bundled third-party template literals can contain significant trailing spaces.
+dist/*.js -whitespace

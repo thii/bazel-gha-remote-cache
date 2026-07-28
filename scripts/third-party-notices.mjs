@@ -129,6 +129,65 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.`
 
+// These historical James Halliday packages declare MIT or MIT/X11 in their
+// metadata/readmes but their npm tarballs omit a standalone license file. The
+// text and attribution match the author's contemporaneous traverse package;
+// Debian's node-buffers copyright record also identifies buffers@0.1.1 as MIT.
+const SUBSTACK_MIT = `Copyright 2010 James Halliday (mail@substack.net)
+
+This project is free software released under the MIT/X11 license:
+http://www.opensource.org/licenses/mit-license.php
+
+Copyright 2010 James Halliday (mail@substack.net)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.`
+
+// isarray@1.0.0 places its complete MIT notice in README.md instead of a
+// standalone license file.
+const ISARRAY_MIT = `Copyright (c) 2013 Julian Gruber <julian@juliangruber.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`
+
+const LICENSE_FALLBACKS = new Map([
+  ['@nodable/entities@3.0.0', NODABLE_MIT],
+  ['binary@0.3.0', SUBSTACK_MIT],
+  ['buffers@0.1.1', SUBSTACK_MIT],
+  ['chainsaw@0.1.0', SUBSTACK_MIT],
+  ['isarray@1.0.0', ISARRAY_MIT]
+])
+
 function packageRoot(input) {
   const marker = 'node_modules/'
   const index = input.lastIndexOf(marker)
@@ -165,7 +224,7 @@ async function bundledPackages() {
 }
 
 function addDocument(groups, label, content) {
-  const normalized = content.trim()
+  const normalized = content.trim().replace(/[ \t]+$/gmu, '')
   const digest = createHash('sha256').update(normalized).digest('hex')
   const group = groups.get(digest) ?? {labels: [], content: normalized}
   group.labels.push(label)
@@ -188,12 +247,9 @@ async function render() {
       .filter(file => LICENSE_FILE.test(path.basename(file)))
       .sort()
     if (files.length === 0) {
-      if (label === '@nodable/entities@3.0.0') {
-        addDocument(
-          groups,
-          `${label} (upstream repository license)`,
-          NODABLE_MIT
-        )
+      const fallback = LICENSE_FALLBACKS.get(label)
+      if (fallback !== undefined) {
+        addDocument(groups, `${label} (upstream license)`, fallback)
         continue
       }
       throw new Error(`${label} did not include a license or notice file`)

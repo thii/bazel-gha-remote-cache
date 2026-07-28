@@ -19,10 +19,32 @@ import {
   removeControlDirectory,
   writePrivateFile
 } from './control.js'
+import {
+  diagnosticsArtifactName,
+  shouldUploadDiagnostics,
+  uploadDiagnosticsArtifact
+} from './diagnostics.js'
 import {safeErrorMessage, sleep, validateDaemonReady} from './lifecycle.js'
-import type {DaemonConfig, DaemonReady} from './model.js'
+import {
+  CONTROL_DIRECTORY_PREFIX,
+  type DaemonConfig,
+  type DaemonReady
+} from './model.js'
 
 const STARTUP_TIMEOUT_MS = 20_000
+
+function startupDiagnosticMode(raw: string): 'on-error' | 'always' | 'never' {
+  const value = (raw || 'on-error').toLowerCase()
+  return value === 'always' || value === 'never' || value === 'on-error'
+    ? value
+    : 'on-error'
+}
+
+function startupDiagnosticRetention(raw: string): number {
+  if (!/^[1-9][0-9]*$/.test(raw)) return 7
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value <= 90 ? value : 7
+}
 
 function daemonEntryPoint(): string {
   return fileURLToPath(new URL('daemon.js', import.meta.url))
@@ -139,38 +161,78 @@ async function waitForReady(
 }
 
 async function run(): Promise<void> {
-  const inputs = parseInputs(name => core.getInput(name))
-  if (inputs.githubToken) core.setSecret(inputs.githubToken)
-  // Preserve this policy outside the daemon-owned control files so the post
-  // step can still honor it when those files are missing or malformed.
-  core.saveState('fail_job_on_cache_error', String(inputs.failJobOnCacheError))
-  const credentials = validateCacheEnvironment()
-  const {runtimeToken} = credentials
-  core.setSecret(runtimeToken)
-
-  const context = await loadEventContext()
-  const permissions = resolvePermissions(
-    inputs.mode,
-    context,
-    process.env['ACTIONS_CACHE_MODE']
-  )
-  if (
-    inputs.storageMode === 'pack' &&
-    permissions.readable &&
-    !inputs.githubToken
-  ) {
-    throw new Error(
-      'github-token is required for readable packed storage; grant Actions read permission or select storage-mode: object'
-    )
-  }
   const runnerTemp = process.env['RUNNER_TEMP'] ?? ''
-  const controlDirectory = await createControlDirectory(runnerTemp)
+  const instanceId = randomUUID()
+  const jobHash = createHash('sha256')
+    .update(instanceId)
+    .digest('hex')
+    .slice(0, 16)
+  const environmentRunId = process.env['GITHUB_RUN_ID'] ?? '0'
+  const runId = /^(0|[1-9][0-9]*)$/.test(environmentRunId)
+    ? environmentRunId
+    : '0'
+  const artifactName = diagnosticsArtifactName(runId, jobHash)
+  core.setOutput('diagnostics-artifact-name', artifactName)
+
+  let uploadDiagnostics = startupDiagnosticMode(
+    core.getInput('upload-diagnostics')
+  )
+  let diagnosticsRetentionDays = startupDiagnosticRetention(
+    core.getInput('diagnostics-retention-days')
+  )
+  core.saveState('upload_diagnostics', uploadDiagnostics)
+  core.saveState('diagnostics_retention_days', String(diagnosticsRetentionDays))
+  const rawGithubToken = core.getInput('github-token')
+  if (rawGithubToken) core.setSecret(rawGithubToken)
+  const rawRuntimeToken = process.env['ACTIONS_RUNTIME_TOKEN']
+  if (rawRuntimeToken) core.setSecret(rawRuntimeToken)
+
+  let controlDirectory = runnerTemp
+    ? path.join(
+        path.resolve(runnerTemp),
+        `${CONTROL_DIRECTORY_PREFIX}${instanceId}`
+      )
+    : ''
   let child: ChildProcess | undefined
   let childSpawnError: Error | undefined
 
   try {
+    const inputs = parseInputs(name => core.getInput(name))
+    if (inputs.githubToken) core.setSecret(inputs.githubToken)
+    uploadDiagnostics = inputs.uploadDiagnostics
+    diagnosticsRetentionDays = inputs.diagnosticsRetentionDays
+    // Preserve policy outside daemon-owned files so post can still honor it
+    // when those files are missing or malformed.
+    core.saveState(
+      'fail_job_on_cache_error',
+      String(inputs.failJobOnCacheError)
+    )
+    core.saveState('upload_diagnostics', uploadDiagnostics)
+    core.saveState(
+      'diagnostics_retention_days',
+      String(diagnosticsRetentionDays)
+    )
+    const credentials = validateCacheEnvironment()
+    const {runtimeToken} = credentials
+    core.setSecret(runtimeToken)
+
+    const context = await loadEventContext()
+    const permissions = resolvePermissions(
+      inputs.mode,
+      context,
+      process.env['ACTIONS_CACHE_MODE']
+    )
+    if (
+      inputs.storageMode === 'pack' &&
+      permissions.readable &&
+      !inputs.githubToken
+    ) {
+      throw new Error(
+        'github-token is required for readable packed storage; grant Actions read permission or select storage-mode: object'
+      )
+    }
+    controlDirectory = await createControlDirectory(runnerTemp)
     const shutdownToken = randomBytes(32).toString('base64url')
-    const instanceId = randomUUID()
     const githubRepository =
       process.env['GITHUB_REPOSITORY'] ?? 'local/repository'
     const config: DaemonConfig = {
@@ -204,11 +266,8 @@ async function run(): Promise<void> {
       defaultRef: context.defaultBranch
         ? `refs/heads/${context.defaultBranch}`
         : context.ref,
-      runId: process.env['GITHUB_RUN_ID'] ?? '0',
-      jobHash: createHash('sha256')
-        .update(instanceId)
-        .digest('hex')
-        .slice(0, 16),
+      runId,
+      jobHash,
       controlDirectory,
       shutdownToken,
       instanceId
@@ -272,7 +331,35 @@ async function run(): Promise<void> {
     )
   } catch (error) {
     if (child !== undefined) await terminateChild(child)
-    await removeControlDirectory(controlDirectory, runnerTemp).catch(() => {})
+    // A caught startup failure is fully handled here. Clear daemon identity so
+    // the always-running post entry point does not attempt a second upload or
+    // operate on control files that this path removes.
+    core.saveState('pid', '')
+    core.saveState('control_directory', '')
+    core.saveState('instance_id', '')
+    if (shouldUploadDiagnostics(uploadDiagnostics, true, true)) {
+      try {
+        const uploaded = await uploadDiagnosticsArtifact({
+          runnerTemp,
+          controlDirectory,
+          artifactName,
+          retentionDays: diagnosticsRetentionDays,
+          reason: 'startup-failure',
+          phase: 'startup',
+          lifecycleErrors: [safeErrorMessage(error)]
+        })
+        core.notice(
+          `Uploaded cache diagnostics artifact ${artifactName}${uploaded.id === undefined ? '.' : ` (ID ${uploaded.id}).`}`
+        )
+      } catch (uploadError) {
+        core.warning(
+          `Could not upload cache startup diagnostics: ${safeErrorMessage(uploadError)}`
+        )
+      }
+    }
+    if (controlDirectory && runnerTemp) {
+      await removeControlDirectory(controlDirectory, runnerTemp).catch(() => {})
+    }
     throw error
   }
 }

@@ -11,6 +11,7 @@ import {
   type CacheLookup,
   type CacheReservation
 } from '../src/backend.js'
+import {DiagnosticJournal} from '../src/diagnostics.js'
 import {Metrics} from '../src/metrics.js'
 import {CACHE_VERSION, type DaemonConfig} from '../src/model.js'
 import {CacheHttpServer, objectCacheKey} from '../src/server.js'
@@ -192,6 +193,7 @@ interface RunningServer {
   backend: MemoryBackend
   baseUrl: string
   config: DaemonConfig
+  diagnostics: DiagnosticJournal
   metrics: Metrics
   server: CacheHttpServer
   stop: () => Promise<void>
@@ -240,10 +242,14 @@ async function startServer(
     ...overrides
   }
   const metrics = new Metrics(config.readable, config.writable)
+  const diagnostics = new DiagnosticJournal(
+    path.join(controlDirectory, 'errors.ndjson')
+  )
   const server = new CacheHttpServer({
     config,
     backend,
     metrics,
+    diagnostics,
     onShutdown,
     ...(shutdownDrainMs === undefined ? {} : {shutdownDrainMs})
   })
@@ -252,10 +258,12 @@ async function startServer(
     backend,
     baseUrl: `http://127.0.0.1:${address.port}`,
     config,
+    diagnostics,
     metrics,
     server,
     stop: async () => {
       await server.shutdown()
+      await diagnostics.flush()
       await rm(controlDirectory, {recursive: true, force: true})
     }
   }
@@ -342,6 +350,21 @@ test('CAS mismatch never reaches the backend and permanently suppresses AC write
   assert.equal(ac.status, 503)
   assert.equal(running.backend.reserveCalls.length, 0)
   assert.equal(running.metrics.snapshot().casWriteFailed, true)
+  assert.equal(await running.diagnostics.flush(), undefined)
+  const diagnostics = await readFile(running.diagnostics.filePath, 'utf8')
+  const errors = diagnostics
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  const matchingErrors = errors.filter(
+    error =>
+      error.area === 'http' &&
+      error.operation === 'put' &&
+      error.kind === 'cas' &&
+      error.message === 'CAS digest did not match request bytes' &&
+      error.statusCode === 400
+  )
+  assert.equal(matchingErrors.length, 1)
 })
 
 test('oversize and encoded uploads are rejected before backend reservation', async t => {
@@ -421,6 +444,20 @@ test('an early Expect rejection of CAS permanently suppresses AC writes', async 
     backend.finalizeCalls.some(call => call.key.includes('-ac-sha256-')),
     false
   )
+  assert.equal(await running.diagnostics.flush(), undefined)
+  const diagnostics = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  const earlyRejections = diagnostics.filter(
+    error =>
+      error.area === 'http' &&
+      error.operation === 'expect' &&
+      error.kind === 'cas' &&
+      error.message === 'cache object exceeds max-object-size' &&
+      error.statusCode === 413
+  )
+  assert.equal(earlyRejections.length, 1)
 })
 
 test('strict routes reject malformed digests, extra path data, and queries', async t => {
@@ -472,6 +509,16 @@ test('AC backend errors degrade to misses while CAS errors remain retryable', as
   assert.equal(ac.status, 404)
   assert.equal(cas.status, 503)
   assert.equal(running.metrics.snapshot().backend.errors, 2)
+  assert.equal(await running.diagnostics.flush(), undefined)
+  const diagnostics = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  const httpErrors = diagnostics.filter(
+    error => error.area === 'http' && error.operation === 'get'
+  )
+  assert.equal(httpErrors.length, 2)
+  assert.deepEqual(httpErrors.map(error => error.kind).sort(), ['ac', 'cas'])
 })
 
 test('invalid signed-download headers cancel the upstream response body', async t => {

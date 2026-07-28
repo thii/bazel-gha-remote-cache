@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import {createHash} from 'node:crypto'
 import path from 'node:path'
 import {
   CONTROL_FILES,
@@ -7,6 +8,15 @@ import {
   readJsonFile,
   removeControlDirectory
 } from './control.js'
+import {
+  buildDiagnosticsDocument,
+  diagnosticsArtifactName,
+  redactDiagnosticText,
+  shouldUploadDiagnostics,
+  uploadDiagnosticsDocument,
+  type DiagnosticsArtifactDocument,
+  type DiagnosticUploadMode
+} from './diagnostics.js'
 import {
   metricsHaveCacheErrors,
   processIsRunning,
@@ -275,6 +285,11 @@ async function addSummary(stats: MetricsSnapshot): Promise<void> {
       '⚠️ A CAS write failed, so later action-cache uploads were suppressed for integrity.\n'
     )
   }
+  if (stats.diagnosticJournalFailed) {
+    core.summary.addRaw(
+      '⚠️ The structured diagnostic journal could not be written completely.\n'
+    )
+  }
   await core.summary.write()
 }
 
@@ -298,6 +313,61 @@ async function run(failJobOnCacheError: boolean): Promise<void> {
   let stopped = !processIsRunning(pid)
   let stats: MetricsSnapshot | undefined
   let cleanupError = false
+  const lifecycleErrors: string[] = []
+
+  const uploadPreparedDiagnostics = async (
+    retentionDays: number,
+    document: DiagnosticsArtifactDocument
+  ): Promise<void> => {
+    const environmentRunId = process.env['GITHUB_RUN_ID'] ?? '0'
+    const runId = /^(0|[1-9][0-9]*)$/.test(environmentRunId)
+      ? environmentRunId
+      : '0'
+    const jobHash =
+      config?.jobHash ??
+      createHash('sha256')
+        .update(expectedInstanceId || controlDirectory)
+        .digest('hex')
+        .slice(0, 16)
+    const artifactName = diagnosticsArtifactName(runId, jobHash)
+    try {
+      const uploaded = await uploadDiagnosticsDocument(
+        {
+          runnerTemp,
+          artifactName,
+          retentionDays
+        },
+        document
+      )
+      const runUrl =
+        uploaded.id === undefined ||
+        !process.env['GITHUB_SERVER_URL'] ||
+        !process.env['GITHUB_REPOSITORY'] ||
+        !process.env['GITHUB_RUN_ID']
+          ? undefined
+          : `${process.env['GITHUB_SERVER_URL']}/${process.env['GITHUB_REPOSITORY']}/actions/runs/${process.env['GITHUB_RUN_ID']}/artifacts/${uploaded.id}`
+      core.notice(
+        runUrl === undefined
+          ? `Uploaded cache diagnostics artifact ${artifactName}.`
+          : `Uploaded cache diagnostics artifact ${artifactName}: ${runUrl}`
+      )
+      core.summary.addRaw(
+        runUrl === undefined
+          ? `Cache diagnostics artifact: \`${artifactName}\`\n`
+          : `Cache diagnostics artifact: [\`${artifactName}\`](${runUrl})\n`
+      )
+      await core.summary.write()
+    } catch (error) {
+      core.warning(
+        `Could not upload cache diagnostics: ${safeErrorMessage(error)}`
+      )
+    }
+  }
+
+  const uploadMode = diagnosticUploadMode(core.getState('upload_diagnostics'))
+  const diagnosticsRetentionDays = diagnosticRetentionDays(
+    core.getState('diagnostics_retention_days')
+  )
   try {
     config = validateDaemonConfig(
       await readJsonFile<unknown>(
@@ -333,22 +403,84 @@ async function run(failJobOnCacheError: boolean): Promise<void> {
     }
   } catch (error) {
     cleanupError = true
-    core.warning(`Cache daemon cleanup warning: ${safeErrorMessage(error)}`)
-  } finally {
-    if (stopped) {
-      await removeControlDirectory(controlDirectory, runnerTemp).catch(
-        error => {
-          cleanupError = true
-          core.warning(
-            `Could not remove cache control files: ${safeErrorMessage(error)}`
-          )
-        }
-      )
-    } else {
+    const message = safeErrorMessage(error)
+    lifecycleErrors.push(message)
+    core.warning(`Cache daemon cleanup warning: ${message}`)
+  }
+
+  let diagnosticsDocument: DiagnosticsArtifactDocument | undefined
+  if (uploadMode !== 'never') {
+    try {
+      diagnosticsDocument = await buildDiagnosticsDocument({
+        runnerTemp,
+        controlDirectory,
+        artifactName: diagnosticsArtifactName(
+          /^(0|[1-9][0-9]*)$/.test(process.env['GITHUB_RUN_ID'] ?? '')
+            ? (process.env['GITHUB_RUN_ID'] as string)
+            : '0',
+          config?.jobHash ??
+            createHash('sha256')
+              .update(expectedInstanceId || controlDirectory)
+              .digest('hex')
+              .slice(0, 16)
+        ),
+        retentionDays: diagnosticsRetentionDays,
+        reason: 'cache-errors',
+        phase: 'post',
+        stopped,
+        lifecycleErrors,
+        ...(stats === undefined ? {} : {stats})
+      })
+    } catch (error) {
       core.warning(
-        `Cache daemon identity could not be safely terminated; control files remain at ${controlDirectory}.`
+        `Could not prepare cache diagnostics: ${safeErrorMessage(error)}`
       )
     }
+  }
+
+  if (stopped) {
+    try {
+      await removeControlDirectory(controlDirectory, runnerTemp)
+    } catch (error) {
+      cleanupError = true
+      const message = safeErrorMessage(error)
+      lifecycleErrors.push(message)
+      core.warning(`Could not remove cache control files: ${message}`)
+    }
+  } else {
+    const message =
+      'Cache daemon identity could not be safely terminated; private control files were retained.'
+    lifecycleErrors.push(message)
+    core.warning(message)
+  }
+
+  const hasCacheErrors = stats === undefined || metricsHaveCacheErrors(stats)
+  const hasRecordedErrors =
+    (diagnosticsDocument?.errors.length ?? 0) > 0 ||
+    (diagnosticsDocument?.daemonMessages.length ?? 0) > 0
+  if (
+    diagnosticsDocument !== undefined &&
+    shouldUploadDiagnostics(
+      uploadMode,
+      hasCacheErrors || hasRecordedErrors,
+      lifecycleErrors.length > 0
+    )
+  ) {
+    diagnosticsDocument.reason =
+      uploadMode === 'always' &&
+      !hasCacheErrors &&
+      !hasRecordedErrors &&
+      lifecycleErrors.length === 0
+        ? 'always'
+        : 'cache-errors'
+    diagnosticsDocument.lifecycle.stopped = stopped
+    diagnosticsDocument.lifecycle.errors = lifecycleErrors.map(error =>
+      redactDiagnosticText(error).slice(0, 500)
+    )
+    await uploadPreparedDiagnostics(
+      diagnosticsRetentionDays,
+      diagnosticsDocument
+    )
   }
 
   if (
@@ -360,6 +492,18 @@ async function run(failJobOnCacheError: boolean): Promise<void> {
   ) {
     core.setFailed('The Bazel cache adapter observed one or more cache errors.')
   }
+}
+
+function diagnosticUploadMode(raw: string): DiagnosticUploadMode {
+  return raw === 'always' || raw === 'never' || raw === 'on-error'
+    ? raw
+    : 'on-error'
+}
+
+function diagnosticRetentionDays(raw: string): number {
+  if (!/^[1-9][0-9]*$/.test(raw)) return 7
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value <= 90 ? value : 7
 }
 
 const failJobOnCacheError = core.getState('fail_job_on_cache_error') === 'true'

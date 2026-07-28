@@ -4,6 +4,7 @@ import {ActionsCacheBackend} from './backend.js'
 import {PackCatalog} from './catalog.js'
 import {validateCacheEnvironment} from './config.js'
 import {CONTROL_FILES, readJsonFile, writeJsonAtomic} from './control.js'
+import {DiagnosticJournal} from './diagnostics.js'
 import {safeErrorMessage, validateDaemonConfig} from './lifecycle.js'
 import {Metrics} from './metrics.js'
 import type {DaemonConfig, DaemonReady} from './model.js'
@@ -89,6 +90,9 @@ async function run(): Promise<void> {
       : {GITHUB_SERVER_URL: process.env['GITHUB_SERVER_URL']})
   })
   const statsPath = path.join(config.controlDirectory, CONTROL_FILES.stats)
+  const diagnostics = new DiagnosticJournal(
+    path.join(config.controlDirectory, CONTROL_FILES.diagnostics)
+  )
   const metrics = new Metrics(config.readable, config.writable, snapshot =>
     writeJsonAtomic(statsPath, snapshot)
   )
@@ -109,7 +113,7 @@ async function run(): Promise<void> {
   const writeBack =
     pacer === undefined
       ? undefined
-      : new WriteBackQueue({config, backend, metrics, pacer})
+      : new WriteBackQueue({config, backend, metrics, pacer, diagnostics})
 
   let packReader: PackReader | undefined
   if (config.readable && config.storageMode === 'pack') {
@@ -149,6 +153,7 @@ async function run(): Promise<void> {
       backend,
       catalog,
       metrics,
+      diagnostics,
       directory: path.join(config.controlDirectory, 'pack-downloads'),
       maxObjectSize: config.maxObjectSize
     })
@@ -159,6 +164,7 @@ async function run(): Promise<void> {
     config,
     backend,
     metrics,
+    diagnostics,
     ...(writeBack === undefined ? {} : {writeBack}),
     ...(packReader === undefined ? {} : {packReader}),
     onShutdown: () => {
@@ -169,6 +175,13 @@ async function run(): Promise<void> {
   const shutdown = (): Promise<void> => {
     shutdownPromise ??= (async () => {
       await cacheServer.shutdown()
+      const diagnosticError = await diagnostics.flush()
+      if (diagnosticError !== undefined) {
+        metrics.setDiagnosticJournalFailed()
+        process.stderr.write(
+          `Cache diagnostic journal failed: ${safeErrorMessage(diagnosticError)}\n`
+        )
+      }
       metrics.stop()
       await metrics.flush()
     })()

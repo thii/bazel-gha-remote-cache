@@ -14,6 +14,7 @@ import {
   type CacheBackend,
   type CacheReservation
 } from './backend.js'
+import type {DiagnosticJournal} from './diagnostics.js'
 import {Metrics} from './metrics.js'
 import {
   CACHE_KEY_PREFIX,
@@ -84,6 +85,7 @@ export interface WriteBackQueueOptions {
   backend: CacheBackend
   metrics: Metrics
   pacer: EntryPacer
+  diagnostics?: DiagnosticJournal
   now?: () => number
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>
 }
@@ -177,6 +179,7 @@ class EntryCommitter {
     private readonly backend: CacheBackend,
     private readonly pacer: EntryPacer,
     private readonly metrics: Metrics,
+    private readonly diagnostics: DiagnosticJournal | undefined,
     private readonly now: () => number,
     private readonly sleep: (
       milliseconds: number,
@@ -323,6 +326,7 @@ class EntryCommitter {
       return await call()
     } catch (error) {
       this.metrics.backend('errors')
+      this.diagnostics?.record({area: 'backend', operation}, error)
       if (error instanceof BackendError && error.rateLimited) {
         this.metrics.backend('rateLimited')
         this.metrics.rateLimit(operation)
@@ -419,6 +423,7 @@ export class WriteBackQueue {
       options.backend,
       options.pacer,
       options.metrics,
+      options.diagnostics,
       this.now,
       this.sleep
     )
@@ -628,6 +633,10 @@ export class WriteBackQueue {
           await this.sleep(1000, this.workerController.signal).catch(() => {})
           continue
         }
+        this.options.diagnostics?.record(
+          {area: 'write-back', operation: 'worker'},
+          error
+        )
         this.failed = error
         this.recordRemainingObjects()
         this.notifyChange()

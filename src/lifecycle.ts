@@ -341,6 +341,7 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
       rangeBytesDownloaded: counter(catalog, 'rangeBytesDownloaded')
     },
     integrityFailures: counter(data, 'integrityFailures'),
+    diagnosticJournalFailed: booleanField(data, 'diagnosticJournalFailed'),
     casWriteFailed: booleanField(data, 'casWriteFailed'),
     writeCircuitOpen: booleanField(data, 'writeCircuitOpen'),
     readCircuitOpen: booleanField(data, 'readCircuitOpen'),
@@ -355,6 +356,7 @@ export function metricsHaveCacheErrors(stats: MetricsSnapshot): boolean {
     stats.backend.errors > 0 ||
     stats.backend.rateLimited > 0 ||
     stats.integrityFailures > 0 ||
+    stats.diagnosticJournalFailed ||
     stats.casWriteFailed ||
     stats.readCircuitOpen ||
     stats.writeCircuitOpen ||

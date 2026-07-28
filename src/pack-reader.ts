@@ -8,6 +8,7 @@ import {
   type PackCatalogEntry,
   type PackCatalogMetrics
 } from './catalog.js'
+import type {DiagnosticJournal} from './diagnostics.js'
 import {Metrics} from './metrics.js'
 import type {CacheKind} from './model.js'
 import {
@@ -51,6 +52,7 @@ export interface PackReaderOptions {
   backend: CacheBackend
   catalog: PackCatalog<ParsedPackCacheKey>
   metrics: Metrics
+  diagnostics?: DiagnosticJournal
   directory: string
   maxObjectSize: number
   indexCacheSize?: number
@@ -135,6 +137,16 @@ export class PackReader {
           if (error instanceof BackendError && error.rateLimited) {
             throw error
           }
+          this.options.diagnostics?.record(
+            {
+              area: 'pack-reader',
+              operation: 'candidate',
+              kind,
+              digest,
+              fallback: 'legacy-object'
+            },
+            error
+          )
           if (!(error instanceof BackendError)) {
             this.options.metrics.backend('errors')
           }
@@ -404,6 +416,10 @@ export class PackReader {
   private catalogFailure(error: unknown, signal?: AbortSignal): undefined {
     if (signal?.aborted) throw error
     this.options.metrics.backend('errors')
+    this.options.diagnostics?.record(
+      {area: 'catalog', operation: 'refresh'},
+      error
+    )
     if (error instanceof PackCatalogError && error.rateLimited) {
       throw new BackendError('GitHub cache catalog is rate limited', {
         statusCode: error.statusCode ?? 429,
@@ -427,6 +443,7 @@ export class PackReader {
       return await call()
     } catch (error) {
       this.options.metrics.backend('errors')
+      this.options.diagnostics?.record({area: 'backend', operation}, error)
       if (error instanceof BackendError && error.rateLimited) {
         this.options.metrics.backend('rateLimited')
         this.options.metrics.rateLimit(operation)

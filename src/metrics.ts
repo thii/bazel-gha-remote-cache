@@ -75,6 +75,7 @@ export class Metrics {
         rangeBytesDownloaded: 0
       },
       integrityFailures: 0,
+      diagnosticJournalFailed: false,
       casWriteFailed: false,
       writeCircuitOpen: false,
       readCircuitOpen: false,
@@ -213,6 +214,11 @@ export class Metrics {
 
   integrityFailure(): void {
     this.data.integrityFailures += 1
+    this.schedulePersist()
+  }
+
+  setDiagnosticJournalFailed(): void {
+    this.data.diagnosticJournalFailed = true
     this.schedulePersist()
   }
 
