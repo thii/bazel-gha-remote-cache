@@ -423,10 +423,11 @@ test('an abandoned final index waiter cannot poison the next reader', async t =>
     },
     async (_url, offset, length) => rangeResponse(built.bytes, offset, length)
   )
+  const metrics = new Metrics(true, false)
   const reader = new PackReader({
     backend,
     catalog,
-    metrics: new Metrics(true, false),
+    metrics,
     directory: await temporaryDirectory(t),
     maxObjectSize: 1024
   })
@@ -445,7 +446,55 @@ test('an abandoned final index waiter cannot poison the next reader', async t =>
   assert.ok(settleFirstTransport)
   settleFirstTransport()
   await nextTurn()
+  assert.equal(metrics.snapshot().backend.errors, 0)
   await recovered.dispose()
+})
+
+test('a rate limit racing with an abandoned index waiter is still counted', async t => {
+  const payload = Buffer.from('rate-limited abandoned flight')
+  const objectDigest = digest(payload)
+  const built = buildPack([{kind: 'cas', digest: objectDigest, payload}])
+  const key = packKey(built, 22)
+  const {catalog} = catalogFor([
+    {
+      key,
+      size: built.bytes.byteLength,
+      createdAt: '2026-07-26T12:00:00.000Z'
+    }
+  ])
+  let rejectLookup: ((error: Error) => void) | undefined
+  const backend = new FakeBackend(
+    async () =>
+      new Promise<CacheLookup>((_resolve, reject) => {
+        rejectLookup = reject
+      }),
+    async () => assert.fail('a failed lookup must not download')
+  )
+  const metrics = new Metrics(true, false)
+  const reader = new PackReader({
+    backend,
+    catalog,
+    metrics,
+    directory: await temporaryDirectory(t),
+    maxObjectSize: 1024
+  })
+  const controller = new AbortController()
+
+  const abandoned = reader.materialize('cas', objectDigest, controller.signal)
+  await waitUntil(() => backend.lookupCalls.length === 1)
+  controller.abort()
+  await assert.rejects(abandoned, /aborted/)
+  assert.ok(rejectLookup)
+  rejectLookup(
+    new BackendError('pack lookup rate limited', {
+      statusCode: 429,
+      rateLimited: true,
+      retryable: true,
+      retryAfterMs: 1000
+    })
+  )
+  await waitUntil(() => metrics.snapshot().backend.rateLimited === 1)
+  assert.equal(metrics.snapshot().backend.errors, 1)
 })
 
 test('a cold empty catalog allows one follow-up refresh, then applies the miss cooldown', async t => {

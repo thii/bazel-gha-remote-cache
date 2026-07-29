@@ -246,7 +246,8 @@ async function addSummary(stats: MetricsSnapshot): Promise<void> {
       ['Catalog refreshes', String(stats.catalog.refreshes)],
       ['Bloom candidates', String(stats.catalog.bloomCandidates)],
       ['Bloom false positives', String(stats.catalog.bloomFalsePositives)],
-      ['Range bytes downloaded', String(stats.catalog.rangeBytesDownloaded)]
+      ['Range bytes downloaded', String(stats.catalog.rangeBytesDownloaded)],
+      ['Client-cancelled GETs', String(stats.requests.aborted)]
     ])
     .addRaw(
       `Backend calls: ${stats.backend.lookups} lookups, ${stats.backend.reservations} reservations, ${stats.backend.uploads} uploads, ${stats.backend.finalizations} finalizations. ` +

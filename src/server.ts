@@ -12,6 +12,14 @@ import {pipeline} from 'node:stream/promises'
 import type {ReadableStream as NodeReadableStream} from 'node:stream/web'
 import type {AddressInfo} from 'node:net'
 import {BackendError, type CacheBackend, type CacheLookup} from './backend.js'
+import {
+  ClientDisconnectError,
+  ServerShutdownError,
+  isClientDisconnectCancellation,
+  isClientDisconnectSignal,
+  isSuppressibleAbortError,
+  signalReason
+} from './cancellation.js'
 import {CapacityLimiter} from './concurrency.js'
 import type {DiagnosticJournal} from './diagnostics.js'
 import {Metrics} from './metrics.js'
@@ -201,6 +209,12 @@ class RateCircuit {
       this.onChange(false)
     }
   }
+
+  abandon(lease: CircuitLease): void {
+    if (lease.probeId !== undefined && lease.probeId === this.probeId) {
+      this.probeId = undefined
+    }
+  }
 }
 
 interface ObjectPath {
@@ -351,10 +365,15 @@ function abortForRequest(
   response: ServerResponse
 ): AbortController {
   const controller = new AbortController()
-  if (request.aborted || response.destroyed) controller.abort()
-  request.once('aborted', () => controller.abort())
+  const disconnect = (): void => {
+    if (!controller.signal.aborted) {
+      controller.abort(new ClientDisconnectError())
+    }
+  }
+  if (request.aborted || response.destroyed) disconnect()
+  request.once('aborted', disconnect)
   response.once('close', () => {
-    if (!response.writableEnded) controller.abort()
+    if (!response.writableEnded) disconnect()
   })
   return controller
 }
@@ -363,9 +382,10 @@ function awaitWithAbort<T>(
   operation: Promise<T>,
   signal: AbortSignal
 ): Promise<T> {
-  if (signal.aborted) return Promise.reject(new Error('request aborted'))
+  if (signal.aborted)
+    return Promise.reject(signalReason(signal, 'request aborted'))
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error('request aborted'))
+    const onAbort = (): void => reject(signalReason(signal, 'request aborted'))
     signal.addEventListener('abort', onAbort, {once: true})
     void operation.then(
       value => {
@@ -378,6 +398,88 @@ function awaitWithAbort<T>(
       }
     )
   })
+}
+
+const CLIENT_STREAM_ERROR_CODES = new Set([
+  'ABORT_ERR',
+  'ECONNRESET',
+  'EPIPE',
+  'ERR_STREAM_PREMATURE_CLOSE'
+])
+
+interface ResponseStreamObservation {
+  readonly sourceFailedBeforeResponseClose: boolean
+  dispose(): void
+}
+
+function observeResponseStream(
+  request: IncomingMessage,
+  response: ServerResponse,
+  sources: readonly Readable[]
+): ResponseStreamObservation {
+  let responseClosed = request.aborted || response.destroyed
+  let sourceFailedBeforeResponseClose = false
+  const ended = new Set<Readable>()
+  const onResponseClose = (): void => {
+    responseClosed = true
+  }
+  request.once('aborted', onResponseClose)
+  const listeners = sources.map(source => {
+    const onEnd = (): void => {
+      ended.add(source)
+    }
+    const onError = (): void => {
+      if (!responseClosed) sourceFailedBeforeResponseClose = true
+    }
+    const onClose = (): void => {
+      if (!responseClosed && !ended.has(source)) {
+        sourceFailedBeforeResponseClose = true
+      }
+    }
+    source.once('end', onEnd)
+    source.once('error', onError)
+    source.once('close', onClose)
+    return {source, onEnd, onError, onClose}
+  })
+  response.once('close', onResponseClose)
+  response.once('error', onResponseClose)
+  return {
+    get sourceFailedBeforeResponseClose() {
+      return sourceFailedBeforeResponseClose
+    },
+    dispose() {
+      request.off('aborted', onResponseClose)
+      response.off('close', onResponseClose)
+      response.off('error', onResponseClose)
+      for (const listener of listeners) {
+        listener.source.off('end', listener.onEnd)
+        listener.source.off('error', listener.onError)
+        listener.source.off('close', listener.onClose)
+      }
+    }
+  }
+}
+
+function isClientStreamCancellation(
+  error: unknown,
+  signal: AbortSignal,
+  observation: ResponseStreamObservation
+): boolean {
+  if (
+    !isClientDisconnectSignal(signal) ||
+    observation.sourceFailedBeforeResponseClose ||
+    typeof error !== 'object' ||
+    error === null
+  ) {
+    return false
+  }
+  const value = error as {code?: unknown; name?: unknown}
+  return (
+    error === signal.reason ||
+    (typeof value.code === 'string' &&
+      CLIENT_STREAM_ERROR_CODES.has(value.code)) ||
+    value.name === 'AbortError'
+  )
 }
 
 export class CacheHttpServer {
@@ -529,7 +631,7 @@ export class CacheHttpServer {
     await new Promise<void>((resolve, reject) => {
       const forceTimer = setTimeout(() => {
         for (const controller of this.activeRequestControllers) {
-          controller.abort()
+          controller.abort(new ServerShutdownError())
         }
         this.server.closeAllConnections()
       }, this.shutdownDrainMs)
@@ -567,6 +669,8 @@ export class CacheHttpServer {
           instanceId: this.options.config.instanceId,
           readable: this.options.config.readable,
           writable: this.options.config.writable,
+          clientAbortedRequests:
+            this.options.metrics.snapshot().requests.aborted,
           casHealthy:
             writeBack === undefined
               ? this.integrity.healthy
@@ -713,11 +817,15 @@ export class CacheHttpServer {
     object: ObjectPath
   ): Promise<void> {
     const startedAt = Date.now()
+    const controller = this.requestController(request, response)
     const local = await this.options.writeBack?.openLocal(
       object.kind,
       object.digest
     )
     if (local !== undefined) {
+      const observation = observeResponseStream(request, response, [
+        local.stream
+      ])
       try {
         response.writeHead(200, {
           'Content-Type': 'application/octet-stream',
@@ -731,6 +839,10 @@ export class CacheHttpServer {
           Date.now() - startedAt
         )
       } catch (error) {
+        if (isClientStreamCancellation(error, controller.signal, observation)) {
+          this.options.metrics.request('aborted')
+          return
+        }
         this.options.diagnostics?.record(
           {
             area: 'local-read',
@@ -749,6 +861,8 @@ export class CacheHttpServer {
           0,
           Date.now() - startedAt
         )
+      } finally {
+        observation.dispose()
       }
       return
     }
@@ -757,8 +871,6 @@ export class CacheHttpServer {
       writeEmpty(response, 404)
       return
     }
-    const controller = this.requestController(request, response)
-
     let lease: CircuitLease
     try {
       lease = this.readCircuit.enter()
@@ -792,23 +904,9 @@ export class CacheHttpServer {
           controller.signal
         )
       } catch (error) {
-        if (controller.signal.aborted) {
-          this.options.diagnostics?.record(
-            {
-              area: 'http',
-              operation: 'get',
-              kind: object.kind,
-              digest: object.digest
-            },
-            new RequestError(499, 'request aborted')
-          )
-          this.readCircuit.complete(lease)
-          this.options.metrics.read(
-            object.kind,
-            'error',
-            0,
-            Date.now() - startedAt
-          )
+        if (isClientDisconnectCancellation(error, controller.signal)) {
+          this.readCircuit.abandon(lease)
+          this.options.metrics.request('aborted')
           return
         }
         if (error instanceof BackendError && error.rateLimited) {
@@ -840,12 +938,14 @@ export class CacheHttpServer {
         release?.()
       }
       if (materialized !== undefined) {
+        const source = createReadStream(materialized.path)
+        const observation = observeResponseStream(request, response, [source])
         try {
           response.writeHead(200, {
             'Content-Type': 'application/octet-stream',
             'Content-Length': String(materialized.size)
           })
-          await pipeline(createReadStream(materialized.path), response)
+          await pipeline(source, response)
           this.options.metrics.read(
             object.kind,
             'hit',
@@ -854,6 +954,13 @@ export class CacheHttpServer {
           )
           this.readCircuit.complete(lease)
         } catch (error) {
+          if (
+            isClientStreamCancellation(error, controller.signal, observation)
+          ) {
+            this.readCircuit.complete(lease)
+            this.options.metrics.request('aborted')
+            return
+          }
           this.options.diagnostics?.record(
             {
               area: 'local-read',
@@ -874,6 +981,7 @@ export class CacheHttpServer {
             response.destroy(error instanceof Error ? error : undefined)
           }
         } finally {
+          observation.dispose()
           await materialized.dispose().catch(() => {})
         }
         return
@@ -889,23 +997,16 @@ export class CacheHttpServer {
     try {
       lookup = await this.lookupSingleFlight(key, lease, controller.signal)
     } catch (error) {
+      if (isClientDisconnectCancellation(error, controller.signal)) {
+        this.readCircuit.abandon(lease)
+        this.options.metrics.request('aborted')
+        return
+      }
       if (!(error instanceof BackendError && error.rateLimited)) {
         this.readCircuit.complete(lease)
       }
       this.handleRateLimit(error, this.readCircuit)
       this.options.metrics.read(object.kind, 'error', 0, Date.now() - startedAt)
-      if (controller.signal.aborted) {
-        this.options.diagnostics?.record(
-          {
-            area: 'http',
-            operation: 'get',
-            kind: object.kind,
-            digest: object.digest
-          },
-          new RequestError(499, 'request aborted')
-        )
-        return
-      }
       if (object.kind === 'ac') {
         this.options.diagnostics?.record(
           {
@@ -923,18 +1024,12 @@ export class CacheHttpServer {
     }
 
     if (controller.signal.aborted) {
-      this.options.diagnostics?.record(
-        {
-          area: 'http',
-          operation: 'get',
-          kind: object.kind,
-          digest: object.digest
-        },
-        new RequestError(499, 'request aborted')
-      )
-      this.readCircuit.complete(lease)
-      this.options.metrics.read(object.kind, 'error', 0, Date.now() - startedAt)
-      return
+      if (isClientDisconnectSignal(controller.signal)) {
+        this.readCircuit.complete(lease)
+        this.options.metrics.request('aborted')
+        return
+      }
+      throw signalReason(controller.signal, 'request aborted')
     }
     if (lookup.kind === 'miss') {
       this.readCircuit.complete(lease)
@@ -945,11 +1040,18 @@ export class CacheHttpServer {
 
     let release: (() => void) | undefined
     let bytes = 0
+    let observation: ResponseStreamObservation | undefined
     try {
       release = await this.downloadLimiter.acquire(1, controller.signal)
       this.readCircuit.assertAllowed(lease)
-      const download = await this.observedBackend('downloads', () =>
-        this.options.backend.openDownload(lookup.downloadUrl, controller.signal)
+      const download = await this.observedBackend(
+        'downloads',
+        () =>
+          this.options.backend.openDownload(
+            lookup.downloadUrl,
+            controller.signal
+          ),
+        controller.signal
       )
       const encoding = download.headers.get('content-encoding')
       if (encoding !== null && encoding.toLowerCase() !== 'identity') {
@@ -990,13 +1092,11 @@ export class CacheHttpServer {
         'Content-Type': 'application/octet-stream',
         ...(rawLength === null ? {} : {'Content-Length': rawLength})
       })
-      await pipeline(
-        Readable.fromWeb(
-          download.body as unknown as NodeReadableStream<Uint8Array>
-        ),
-        counter,
-        response
+      const source = Readable.fromWeb(
+        download.body as unknown as NodeReadableStream<Uint8Array>
       )
+      observation = observeResponseStream(request, response, [source, counter])
+      await pipeline(source, counter, response)
       this.readCircuit.complete(lease)
       this.options.metrics.read(
         object.kind,
@@ -1005,6 +1105,15 @@ export class CacheHttpServer {
         Date.now() - startedAt
       )
     } catch (error) {
+      const clientCancellation =
+        observation === undefined
+          ? isClientDisconnectCancellation(error, controller.signal)
+          : isClientStreamCancellation(error, controller.signal, observation)
+      if (clientCancellation) {
+        this.readCircuit.abandon(lease)
+        this.options.metrics.request('aborted')
+        return
+      }
       const recordHttpError = (): void => {
         this.options.diagnostics?.record(
           {
@@ -1045,6 +1154,7 @@ export class CacheHttpServer {
       }
       throw this.backendRequestError(error)
     } finally {
+      observation?.dispose()
       release?.()
     }
   }
@@ -1330,8 +1440,15 @@ export class CacheHttpServer {
         const release = await this.downloadLimiter.acquire(1, controller.signal)
         try {
           this.readCircuit.assertAllowed(lease)
-          return await this.observedBackend('lookups', () =>
-            this.options.backend.lookup(key, CACHE_VERSION, controller.signal)
+          return await this.observedBackend(
+            'lookups',
+            () =>
+              this.options.backend.lookup(
+                key,
+                CACHE_VERSION,
+                controller.signal
+              ),
+            controller.signal
           )
         } finally {
           release()
@@ -1404,12 +1521,14 @@ export class CacheHttpServer {
       | 'uploads'
       | 'finalizations'
       | 'downloads',
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
+    signal?: AbortSignal
   ): Promise<T> {
     this.options.metrics.backend(counter)
     try {
       return await operation()
     } catch (error) {
+      if (isSuppressibleAbortError(error, signal)) throw error
       this.options.metrics.backend('errors')
       const operation = {
         lookups: 'lookup',

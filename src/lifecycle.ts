@@ -210,7 +210,7 @@ export function validateDaemonReady(value: unknown): DaemonReady {
 
 export function validateMetrics(value: unknown): MetricsSnapshot {
   const data = record(value)
-  if (data['schemaVersion'] !== 2) throw new Error('unknown metrics schema')
+  if (data['schemaVersion'] !== 3) throw new Error('unknown metrics schema')
 
   const timestamp = (source: Record<string, unknown>, name: string): string => {
     const result = stringField(source, name)
@@ -279,7 +279,7 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
   }
 
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     startedAt: timestamp(data, 'startedAt'),
     ...(stoppedAt === undefined ? {} : {stoppedAt}),
     readable: booleanField(data, 'readable'),
@@ -289,7 +289,8 @@ export function validateMetrics(value: unknown): MetricsSnapshot {
       shutdown: counter(requests, 'shutdown'),
       get: counter(requests, 'get'),
       put: counter(requests, 'put'),
-      rejected: counter(requests, 'rejected')
+      rejected: counter(requests, 'rejected'),
+      aborted: counter(requests, 'aborted')
     },
     reads: {
       ac: kindCounters(reads['ac']),

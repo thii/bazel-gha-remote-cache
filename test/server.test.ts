@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import {createHash, randomUUID} from 'node:crypto'
-import {mkdtemp, readFile, readdir, rm} from 'node:fs/promises'
+import {createReadStream} from 'node:fs'
+import {mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises'
 import {request as httpRequest, type ClientRequest} from 'node:http'
 import {tmpdir} from 'node:os'
 import path from 'node:path'
+import {Readable} from 'node:stream'
 import test from 'node:test'
 import {
   BackendError,
@@ -14,7 +16,9 @@ import {
 import {DiagnosticJournal} from '../src/diagnostics.js'
 import {Metrics} from '../src/metrics.js'
 import {CACHE_VERSION, type DaemonConfig} from '../src/model.js'
+import type {PackReader} from '../src/pack-reader.js'
 import {CacheHttpServer, objectCacheKey} from '../src/server.js'
+import type {WriteBackQueue} from '../src/writeback.js'
 
 class Deferred<T> {
   readonly promise: Promise<T>
@@ -199,11 +203,18 @@ interface RunningServer {
   stop: () => Promise<void>
 }
 
+interface ServerComponents {
+  now?: () => number
+  packReader?: PackReader
+  writeBack?: WriteBackQueue
+}
+
 async function startServer(
   backend = new MemoryBackend(),
   overrides: Partial<DaemonConfig> = {},
   onShutdown: () => void = () => {},
-  shutdownDrainMs?: number
+  shutdownDrainMs?: number,
+  components: ServerComponents = {}
 ): Promise<RunningServer> {
   const controlDirectory = await mkdtemp(
     path.join(tmpdir(), 'brc-server-test-')
@@ -251,6 +262,7 @@ async function startServer(
     metrics,
     diagnostics,
     onShutdown,
+    ...components,
     ...(shutdownDrainMs === undefined ? {} : {shutdownDrainMs})
   })
   const address = await server.start()
@@ -267,6 +279,39 @@ async function startServer(
       await rm(controlDirectory, {recursive: true, force: true})
     }
   }
+}
+
+async function cancelAfterFirstResponseChunk(url: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const settle = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      if (error === undefined) resolve()
+      else reject(error)
+    }
+    const request = httpRequest(url, response => {
+      response.once('data', () => response.destroy())
+      response.once('close', () => settle())
+      response.once('error', error => {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'ECONNRESET') settle()
+        else settle(error)
+      })
+      response.resume()
+    })
+    request.once('error', error => {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ECONNRESET') settle()
+      else settle(error)
+    })
+    request.end()
+  })
+}
+
+async function assertNoDiagnostics(running: RunningServer): Promise<void> {
+  assert.equal(await running.diagnostics.flush(), undefined)
+  assert.equal(await readFile(running.diagnostics.filePath, 'utf8'), '')
 }
 
 function digest(value: Buffer | string): string {
@@ -616,6 +661,14 @@ test('an aborted GET queued by the download limiter never opens a signed downloa
 
   upstreamController?.close()
   await active.arrayBuffer()
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 1,
+    'queued client cancellation was not recorded'
+  )
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  await assertNoDiagnostics(running)
 })
 
 test('a same-key control lookup is canceled after its final GET waiter aborts', async t => {
@@ -667,6 +720,116 @@ test('a same-key control lookup is canceled after its final GET waiter aborts', 
     lookupCanceled.promise
   ])
   assert.equal(downloadOpens, 0)
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 2,
+    'lookup client cancellations were not recorded'
+  )
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  await assertNoDiagnostics(running)
+})
+
+test('a 429 racing with the final lookup cancellation is still recorded', async t => {
+  const backend = new MemoryBackend()
+  const lookupStarted = new Deferred<void>()
+  backend.lookupHook = async (_key, _version, signal) => {
+    assert.ok(signal)
+    lookupStarted.resolve()
+    return new Promise<CacheLookup>((_resolve, reject) => {
+      const onAbort = (): void =>
+        reject(
+          new BackendError('lookup rate limited after cancellation', {
+            statusCode: 429,
+            rateLimited: true,
+            retryable: true,
+            retryAfterMs: 1000
+          })
+        )
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, {once: true})
+    })
+  }
+  const running = await startServer(backend)
+  t.after(running.stop)
+  const controller = new AbortController()
+  const response = fetch(`${running.baseUrl}/cache/cas/${'6'.repeat(64)}`, {
+    signal: controller.signal
+  })
+  await lookupStarted.promise
+
+  controller.abort()
+  await assert.rejects(response, {name: 'AbortError'})
+  await waitFor(
+    () => running.metrics.snapshot().backend.rateLimited === 1,
+    'racing 429 was not recorded'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.requests.aborted, 1)
+  assert.equal(stats.backend.errors, 1)
+  await running.diagnostics.flush()
+  const events = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.area, 'backend')
+  assert.equal(events[0]?.operation, 'lookup')
+  assert.equal(events[0]?.statusCode, 429)
+})
+
+test('a cancelled half-open read probe does not close the circuit', async t => {
+  let now = 0
+  let materializations = 0
+  const firstMaterializationStarted = new Deferred<void>()
+  const packReader = {
+    async materialize(_kind: string, _digest: string, signal?: AbortSignal) {
+      materializations += 1
+      if (materializations > 1) return undefined
+      assert.ok(signal)
+      firstMaterializationStarted.resolve()
+      return new Promise<undefined>((_resolve, reject) => {
+        const onAbort = (): void => reject(new Error('pack read aborted'))
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, {once: true})
+      })
+    }
+  } as unknown as PackReader
+  const running = await startServer(
+    new MemoryBackend(),
+    {},
+    undefined,
+    undefined,
+    {now: () => now, packReader}
+  )
+  t.after(running.stop)
+  const circuit = (
+    running.server as unknown as {
+      readCircuit: {trip(milliseconds: number): void}
+    }
+  ).readCircuit
+  circuit.trip(1000)
+  now = 1000
+
+  const controller = new AbortController()
+  const first = fetch(`${running.baseUrl}/cache/cas/${'4'.repeat(64)}`, {
+    signal: controller.signal
+  })
+  await firstMaterializationStarted.promise
+  controller.abort()
+  await assert.rejects(first, {name: 'AbortError'})
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 1,
+    'half-open probe cancellation was not observed'
+  )
+  assert.equal(running.metrics.snapshot().readCircuitOpen, true)
+
+  const second = await fetch(`${running.baseUrl}/cache/cas/${'5'.repeat(64)}`)
+  assert.equal(second.status, 404)
+  assert.equal(materializations, 2)
+  assert.equal(running.metrics.snapshot().readCircuitOpen, false)
+  await assertNoDiagnostics(running)
 })
 
 test('simultaneous reads single-flight the exact Cache v2 lookup', async t => {
@@ -700,6 +863,336 @@ test('simultaneous reads single-flight the exact Cache v2 lookup', async t => {
     ['shared', 'shared']
   )
   assert.equal(backend.lookupCalls.length, 1)
+})
+
+test('a cancelled packed response is not reported as a cache error', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'brc-pack-cancel-'))
+  const payloadPath = path.join(directory, 'payload')
+  const payloadSize = 8 * 1024 * 1024
+  await writeFile(payloadPath, Buffer.alloc(payloadSize, 0x61))
+  let disposed = 0
+  const packReader = {
+    async materialize() {
+      return {
+        path: payloadPath,
+        size: payloadSize,
+        async dispose() {
+          disposed += 1
+        }
+      }
+    }
+  } as unknown as PackReader
+  const running = await startServer(
+    new MemoryBackend(),
+    {maxObjectSize: payloadSize},
+    undefined,
+    undefined,
+    {packReader}
+  )
+  t.after(async () => {
+    await running.stop()
+    await rm(directory, {recursive: true, force: true})
+  })
+
+  await cancelAfterFirstResponseChunk(
+    `${running.baseUrl}/cache/ac/${'a'.repeat(64)}`
+  )
+  await waitFor(
+    () => disposed === 1 && running.metrics.snapshot().requests.aborted === 1,
+    'cancelled pack response did not finish cleanup'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.ac.hits, 0)
+  assert.equal(stats.reads.ac.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  assert.equal(stats.readCircuitOpen, false)
+  await assertNoDiagnostics(running)
+})
+
+test('a genuine packed response source error is still diagnosed', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'brc-pack-error-'))
+  const missingPath = path.join(directory, 'missing')
+  let disposed = 0
+  const packReader = {
+    async materialize() {
+      return {
+        path: missingPath,
+        size: 1,
+        async dispose() {
+          disposed += 1
+        }
+      }
+    }
+  } as unknown as PackReader
+  const running = await startServer(
+    new MemoryBackend(),
+    {},
+    undefined,
+    undefined,
+    {packReader}
+  )
+  t.after(async () => {
+    await running.stop()
+    await rm(directory, {recursive: true, force: true})
+  })
+
+  await assert.rejects(async () => {
+    const response = await fetch(
+      `${running.baseUrl}/cache/ac/${'b'.repeat(64)}`
+    )
+    await response.arrayBuffer()
+  })
+  await waitFor(
+    () => disposed === 1 && running.metrics.snapshot().reads.ac.errors === 1,
+    'pack source error was not recorded'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.requests.aborted, 0)
+  assert.equal(stats.reads.ac.hits, 0)
+  assert.equal(stats.readCircuitOpen, false)
+  assert.equal(await running.diagnostics.flush(), undefined)
+  const events = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.area, 'local-read')
+  assert.equal(events[0]?.operation, 'pack')
+  assert.equal(events[0]?.kind, 'ac')
+})
+
+test('a source-side premature close is not mistaken for a client cancellation', async t => {
+  let opened = false
+  const writeBack = {
+    async start() {},
+    async openLocal() {
+      if (opened) return undefined
+      opened = true
+      let emitted = false
+      const stream = new Readable({
+        read() {
+          if (emitted) return
+          emitted = true
+          this.push(Buffer.alloc(64, 0x64))
+          setImmediate(() => {
+            const error = Object.assign(new Error('Premature close'), {
+              code: 'ERR_STREAM_PREMATURE_CLOSE'
+            })
+            this.destroy(error)
+          })
+        }
+      })
+      return {size: 1024, stream}
+    },
+    async drain() {
+      return {}
+    }
+  } as unknown as WriteBackQueue
+  const running = await startServer(
+    new MemoryBackend(),
+    {},
+    undefined,
+    undefined,
+    {writeBack}
+  )
+  t.after(running.stop)
+
+  await assert.rejects(async () => {
+    const response = await fetch(
+      `${running.baseUrl}/cache/cas/${'e'.repeat(64)}`
+    )
+    await response.arrayBuffer()
+  })
+  await waitFor(
+    () => running.metrics.snapshot().reads.cas.errors === 1,
+    'source-side premature close was not recorded'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.requests.aborted, 0)
+  assert.equal(stats.reads.cas.hits, 0)
+  await running.diagnostics.flush()
+  const events = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.area, 'local-read')
+  assert.equal(events[0]?.operation, 'pending')
+  assert.equal(events[0]?.message, 'Premature close')
+})
+
+test('a cancelled legacy response is not reported as a cache error', async t => {
+  const backend = new MemoryBackend()
+  const objectDigest = 'c'.repeat(64)
+  const key = objectCacheKey('test-v1', 'cas', objectDigest)
+  backend.objects.set(key, Buffer.from('present'))
+  const payloadSize = 8 * 1024 * 1024
+  const chunk = new Uint8Array(64 * 1024).fill(0x62)
+  let emitted = 0
+  backend.downloadHook = async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (emitted * chunk.byteLength >= payloadSize) {
+            controller.close()
+            return
+          }
+          emitted += 1
+          controller.enqueue(chunk)
+        }
+      }),
+      {headers: {'Content-Length': String(payloadSize)}}
+    )
+  const running = await startServer(backend, {maxObjectSize: payloadSize})
+  t.after(running.stop)
+
+  await cancelAfterFirstResponseChunk(
+    `${running.baseUrl}/cache/cas/${objectDigest}`
+  )
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 1,
+    'cancelled legacy response was not observed'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.cas.hits, 0)
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  assert.equal(stats.readCircuitOpen, false)
+  await assertNoDiagnostics(running)
+})
+
+test('a client abort while opening a signed download is not diagnosed', async t => {
+  const backend = new MemoryBackend()
+  const objectDigest = '7'.repeat(64)
+  const key = objectCacheKey('test-v1', 'cas', objectDigest)
+  backend.objects.set(key, Buffer.from('present'))
+  const downloadStarted = new Deferred<void>()
+  backend.downloadHook = async (_url, signal) => {
+    assert.ok(signal)
+    downloadStarted.resolve()
+    return new Promise<Response>((_resolve, reject) => {
+      const onAbort = (): void =>
+        reject(
+          new BackendError('signed cache download failed', {
+            retryable: true,
+            cause: signal.reason
+          })
+        )
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, {once: true})
+    })
+  }
+  const running = await startServer(backend)
+  t.after(running.stop)
+  const controller = new AbortController()
+  const response = fetch(`${running.baseUrl}/cache/cas/${objectDigest}`, {
+    signal: controller.signal
+  })
+  await downloadStarted.promise
+
+  controller.abort()
+  await assert.rejects(response, {name: 'AbortError'})
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 1,
+    'signed-download cancellation was not observed'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  await assertNoDiagnostics(running)
+})
+
+test('an upstream legacy body abort is still diagnosed', async t => {
+  const backend = new MemoryBackend()
+  const objectDigest = 'f'.repeat(64)
+  const key = objectCacheKey('test-v1', 'cas', objectDigest)
+  backend.objects.set(key, Buffer.from('present'))
+  backend.downloadHook = async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Uint8Array.from([1, 2, 3]))
+          setImmediate(() => {
+            const error = Object.assign(new Error('remote body timed out'), {
+              code: 'ABORT_ERR'
+            })
+            controller.error(error)
+          })
+        }
+      }),
+      {headers: {'Content-Length': '1024'}}
+    )
+  const running = await startServer(backend)
+  t.after(running.stop)
+
+  await assert.rejects(async () => {
+    const response = await fetch(`${running.baseUrl}/cache/cas/${objectDigest}`)
+    await response.arrayBuffer()
+  })
+  await waitFor(
+    () => running.metrics.snapshot().reads.cas.errors === 1,
+    'upstream body abort was not recorded'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.requests.aborted, 0)
+  assert.equal(stats.reads.cas.hits, 0)
+  await running.diagnostics.flush()
+  const events = (await readFile(running.diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.area, 'http')
+  assert.equal(events[0]?.operation, 'get')
+  assert.equal(events[0]?.message, 'remote body timed out')
+})
+
+test('a cancelled pending response is not reported as a cache error', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'brc-pending-cancel-'))
+  const payloadPath = path.join(directory, 'payload')
+  const payloadSize = 8 * 1024 * 1024
+  await writeFile(payloadPath, Buffer.alloc(payloadSize, 0x63))
+  const writeBack = {
+    async start() {},
+    async openLocal() {
+      return {size: payloadSize, stream: createReadStream(payloadPath)}
+    },
+    async drain() {
+      return {}
+    }
+  } as unknown as WriteBackQueue
+  const running = await startServer(
+    new MemoryBackend(),
+    {maxObjectSize: payloadSize},
+    undefined,
+    undefined,
+    {writeBack}
+  )
+  t.after(async () => {
+    await running.stop()
+    await rm(directory, {recursive: true, force: true})
+  })
+
+  await cancelAfterFirstResponseChunk(
+    `${running.baseUrl}/cache/cas/${'d'.repeat(64)}`
+  )
+  await waitFor(
+    () => running.metrics.snapshot().requests.aborted === 1,
+    'cancelled pending response was not observed'
+  )
+
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.reads.cas.hits, 0)
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  assert.equal(stats.readCircuitOpen, false)
+  await assertNoDiagnostics(running)
 })
 
 test('confirmed first-writer conflict is an idempotent PUT success', async t => {
@@ -950,7 +1443,12 @@ test('health is loopback-only and shutdown requires the private bearer token', a
 
   const health = await fetch(`${running.baseUrl}/healthz`)
   assert.equal(health.status, 200)
-  assert.equal(((await health.json()) as {status: string}).status, 'ok')
+  const healthBody = (await health.json()) as {
+    status: string
+    clientAbortedRequests: number
+  }
+  assert.equal(healthBody.status, 'ok')
+  assert.equal(healthBody.clientAbortedRequests, 0)
 
   const denied = await fetch(`${running.baseUrl}/shutdown`, {method: 'POST'})
   assert.equal(denied.status, 401)
@@ -1005,5 +1503,17 @@ test(
 
     assert.equal(backendAborted, true)
     assert.equal(await requestFailed, true)
+    const stats = running.metrics.snapshot()
+    assert.equal(stats.requests.aborted, 0)
+    assert.equal(stats.reads.cas.errors, 1)
+    await running.diagnostics.flush()
+    const events = (await readFile(running.diagnostics.filePath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+    assert.equal(
+      events.some(event => event.area === 'http'),
+      true
+    )
   }
 )

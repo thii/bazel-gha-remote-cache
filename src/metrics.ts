@@ -23,7 +23,7 @@ export class Metrics {
     private readonly persist?: (snapshot: MetricsSnapshot) => Promise<void>
   ) {
     this.data = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       startedAt: new Date().toISOString(),
       readable,
       writable,
@@ -32,7 +32,8 @@ export class Metrics {
         shutdown: 0,
         get: 0,
         put: 0,
-        rejected: 0
+        rejected: 0,
+        aborted: 0
       },
       reads: {ac: counters(), cas: counters()},
       writes: {ac: counters(), cas: counters()},

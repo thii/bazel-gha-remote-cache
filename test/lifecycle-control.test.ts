@@ -149,6 +149,7 @@ test('validateDaemonReady accepts only a loopback HTTP root URL', () => {
 test('validateMetrics accepts a real Metrics snapshot', () => {
   const metrics = new Metrics(true, true)
   metrics.request('get')
+  metrics.request('aborted')
   metrics.backend('lookups')
   metrics.read('cas', 'hit', 17, 3)
   metrics.write('ac', 'conflict', 9, 2)
@@ -232,7 +233,7 @@ test('validateMetrics rejects missing or malformed nested control data', () => {
   }
 
   assert.throws(
-    () => validateMetrics({schemaVersion: 2}),
+    () => validateMetrics({schemaVersion: 3}),
     /control data must be a JSON object/
   )
   assert.throws(() => validateMetrics([]), /control data must be a JSON object/)
@@ -242,6 +243,10 @@ test('metricsHaveCacheErrors enforces strict post-step health', () => {
   const clean = new Metrics(true, true).snapshot()
   clean.stoppedAt = new Date().toISOString()
   assert.equal(metricsHaveCacheErrors(clean), false)
+
+  const clientCancellation = structuredClone(clean)
+  clientCancellation.requests.aborted = 1
+  assert.equal(metricsHaveCacheErrors(clientCancellation), false)
 
   for (const mutate of [
     (stats: typeof clean) => {

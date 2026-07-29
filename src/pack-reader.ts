@@ -3,6 +3,11 @@ import {mkdir, open, rm} from 'node:fs/promises'
 import path from 'node:path'
 import {BackendError, type CacheBackend} from './backend.js'
 import {
+  ServerShutdownError,
+  isSuppressibleAbortError,
+  signalReason
+} from './cancellation.js'
+import {
   PackCatalog,
   PackCatalogError,
   type PackCatalogEntry,
@@ -74,9 +79,11 @@ function waitWithAbort<T>(
   signal?: AbortSignal
 ): Promise<T> {
   if (signal === undefined) return promise
-  if (signal.aborted) return Promise.reject(new Error('pack read aborted'))
+  if (signal.aborted)
+    return Promise.reject(signalReason(signal, 'pack read aborted'))
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error('pack read aborted'))
+    const onAbort = (): void =>
+      reject(signalReason(signal, 'pack read aborted'))
     signal.addEventListener('abort', onAbort, {once: true})
     void promise.then(
       value => {
@@ -135,6 +142,12 @@ export class PackReader {
           if (materialized !== undefined) return materialized
         } catch (error) {
           if (error instanceof BackendError && error.rateLimited) {
+            throw error
+          }
+          if (
+            isSuppressibleAbortError(error, signal) ||
+            signal?.reason instanceof ServerShutdownError
+          ) {
             throw error
           }
           this.options.diagnostics?.record(
@@ -255,8 +268,12 @@ export class PackReader {
     candidate: PackCatalogEntry<ParsedPackCacheKey>,
     signal: AbortSignal
   ): Promise<CachedPack | undefined> {
-    const lookup = await this.observedBackend('lookups', 'lookup', () =>
-      this.options.backend.lookup(candidate.key, PACK_CACHE_VERSION, signal)
+    const lookup = await this.observedBackend(
+      'lookups',
+      'lookup',
+      () =>
+        this.options.backend.lookup(candidate.key, PACK_CACHE_VERSION, signal),
+      signal
     )
     if (lookup.kind === 'miss') return undefined
 
@@ -312,8 +329,17 @@ export class PackReader {
     length: number,
     signal?: AbortSignal
   ): Promise<Uint8Array> {
-    const response = await this.observedBackend('downloads', 'download', () =>
-      this.options.backend.openDownloadRange(signedUrl, offset, length, signal)
+    const response = await this.observedBackend(
+      'downloads',
+      'download',
+      () =>
+        this.options.backend.openDownloadRange(
+          signedUrl,
+          offset,
+          length,
+          signal
+        ),
+      signal
     )
     const bytes = new Uint8Array(await response.arrayBuffer())
     if (bytes.byteLength !== length) throw new Error('pack range was truncated')
@@ -351,7 +377,8 @@ export class PackReader {
               offset,
               length,
               signal
-            )
+            ),
+          signal
         )
         const reader = response.body?.getReader()
         if (reader === undefined) throw new Error('pack range returned no body')
@@ -414,7 +441,12 @@ export class PackReader {
   }
 
   private catalogFailure(error: unknown, signal?: AbortSignal): undefined {
-    if (signal?.aborted) throw error
+    if (
+      isSuppressibleAbortError(error, signal) ||
+      signal?.reason instanceof ServerShutdownError
+    ) {
+      throw error
+    }
     this.options.metrics.backend('errors')
     this.options.diagnostics?.record(
       {area: 'catalog', operation: 'refresh'},
@@ -436,12 +468,14 @@ export class PackReader {
   private async observedBackend<T>(
     counter: 'lookups' | 'downloads',
     operation: 'lookup' | 'download',
-    call: () => Promise<T>
+    call: () => Promise<T>,
+    signal?: AbortSignal
   ): Promise<T> {
     this.options.metrics.backend(counter)
     try {
       return await call()
     } catch (error) {
+      if (isSuppressibleAbortError(error, signal)) throw error
       this.options.metrics.backend('errors')
       this.options.diagnostics?.record({area: 'backend', operation}, error)
       if (error instanceof BackendError && error.rateLimited) {

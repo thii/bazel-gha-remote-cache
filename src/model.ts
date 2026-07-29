@@ -63,7 +63,7 @@ export interface KindCounters {
 }
 
 export interface MetricsSnapshot {
-  schemaVersion: 2
+  schemaVersion: 3
   startedAt: string
   stoppedAt?: string
   readable: boolean
@@ -74,6 +74,7 @@ export interface MetricsSnapshot {
     get: number
     put: number
     rejected: number
+    aborted: number
   }
   reads: Record<CacheKind, KindCounters>
   writes: Record<CacheKind, KindCounters>
