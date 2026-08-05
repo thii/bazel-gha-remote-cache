@@ -404,7 +404,8 @@ const CLIENT_STREAM_ERROR_CODES = new Set([
   'ABORT_ERR',
   'ECONNRESET',
   'EPIPE',
-  'ERR_STREAM_PREMATURE_CLOSE'
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'ERR_STREAM_UNABLE_TO_PIPE'
 ])
 
 interface ResponseStreamObservation {

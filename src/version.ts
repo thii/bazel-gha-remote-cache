@@ -1,1 +1,1 @@
-export const ACTION_VERSION = '0.0.6'
+export const ACTION_VERSION = '0.0.7'

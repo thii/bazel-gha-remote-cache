@@ -910,6 +910,64 @@ test('a cancelled packed response is not reported as a cache error', async t => 
   await assertNoDiagnostics(running)
 })
 
+test('a packed response cancelled before piping is not a cache error', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'brc-pack-prepipe-'))
+  const payloadPath = path.join(directory, 'payload')
+  await writeFile(payloadPath, Buffer.from('materialized after cancellation'))
+  const materializeStarted = new Deferred<void>()
+  const clientDisconnected = new Deferred<void>()
+  const releaseMaterialize = new Deferred<void>()
+  let disposed = 0
+  const packReader = {
+    async materialize(_kind: string, _digest: string, signal?: AbortSignal) {
+      assert.ok(signal)
+      materializeStarted.resolve()
+      const onAbort = (): void => clientDisconnected.resolve()
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, {once: true})
+      await releaseMaterialize.promise
+      return {
+        path: payloadPath,
+        size: Buffer.byteLength('materialized after cancellation'),
+        async dispose() {
+          disposed += 1
+        }
+      }
+    }
+  } as unknown as PackReader
+  const running = await startServer(
+    new MemoryBackend(),
+    {},
+    undefined,
+    undefined,
+    {packReader}
+  )
+  t.after(async () => {
+    await running.stop()
+    await rm(directory, {recursive: true, force: true})
+  })
+
+  const request = httpRequest(`${running.baseUrl}/cache/cas/${'9'.repeat(64)}`)
+  request.on('error', () => {})
+  request.end()
+  await materializeStarted.promise
+  request.destroy()
+  await clientDisconnected.promise
+  releaseMaterialize.resolve()
+
+  await waitFor(
+    () => disposed === 1,
+    'cancelled pre-pipe pack response did not finish cleanup'
+  )
+  const stats = running.metrics.snapshot()
+  assert.equal(stats.requests.aborted, 1)
+  assert.equal(stats.reads.cas.hits, 0)
+  assert.equal(stats.reads.cas.errors, 0)
+  assert.equal(stats.backend.errors, 0)
+  assert.equal(stats.readCircuitOpen, false)
+  await assertNoDiagnostics(running)
+})
+
 test('a genuine packed response source error is still diagnosed', async t => {
   const directory = await mkdtemp(path.join(tmpdir(), 'brc-pack-error-'))
   const missingPath = path.join(directory, 'missing')
