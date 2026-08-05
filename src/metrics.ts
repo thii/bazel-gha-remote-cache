@@ -23,7 +23,7 @@ export class Metrics {
     private readonly persist?: (snapshot: MetricsSnapshot) => Promise<void>
   ) {
     this.data = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       startedAt: new Date().toISOString(),
       readable,
       writable,
@@ -71,6 +71,7 @@ export class Metrics {
       },
       catalog: {
         refreshes: 0,
+        signedUrlRefreshes: 0,
         bloomCandidates: 0,
         bloomFalsePositives: 0,
         rangeBytesDownloaded: 0
@@ -165,6 +166,11 @@ export class Metrics {
 
   catalogRefresh(): void {
     this.data.catalog.refreshes += 1
+    this.schedulePersist()
+  }
+
+  signedUrlRefresh(): void {
+    this.data.catalog.signedUrlRefreshes += 1
     this.schedulePersist()
   }
 

@@ -233,7 +233,7 @@ test('validateMetrics rejects missing or malformed nested control data', () => {
   }
 
   assert.throws(
-    () => validateMetrics({schemaVersion: 3}),
+    () => validateMetrics({schemaVersion: 4}),
     /control data must be a JSON object/
   )
   assert.throws(() => validateMetrics([]), /control data must be a JSON object/)

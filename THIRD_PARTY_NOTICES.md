@@ -52,7 +52,7 @@ commit metadata under `src/vendor/actions-toolkit/`.
 - before-after-hook@4.0.0 — Apache-2.0
 - binary@0.3.0 — MIT
 - bottleneck@2.19.5 — MIT
-- brace-expansion@5.0.8 — MIT
+- brace-expansion@5.0.9 — MIT
 - buffer-crc32@1.0.0 — MIT
 - buffers@0.1.1 — unspecified
 - chainsaw@0.1.0 — MIT/X11
@@ -1465,7 +1465,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Applies to:
 
-- brace-expansion@5.0.8
+- brace-expansion@5.0.9
 
 ```text
 MIT License

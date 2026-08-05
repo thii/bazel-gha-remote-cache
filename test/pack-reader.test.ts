@@ -16,6 +16,8 @@ import {
   type CatalogFetch,
   type PackKeyCodec
 } from '../src/catalog.js'
+import {DiagnosticJournal} from '../src/diagnostics.js'
+import {metricsHaveCacheErrors} from '../src/lifecycle.js'
 import {Metrics} from '../src/metrics.js'
 import {
   PACK_BLOOM_BYTES,
@@ -736,11 +738,16 @@ test('an expired signed URL refreshes the exact lookup, index, and payload once'
     }
   )
   const metrics = new Metrics(true, false)
+  const directory = await temporaryDirectory(t)
+  const diagnostics = new DiagnosticJournal(
+    path.join(directory, 'errors.ndjson')
+  )
   const reader = new PackReader({
     backend,
     catalog,
     metrics,
-    directory: await temporaryDirectory(t),
+    diagnostics,
+    directory,
     maxObjectSize: 1024
   })
 
@@ -755,9 +762,257 @@ test('an expired signed URL refreshes the exact lookup, index, and payload once'
   const snapshot = metrics.snapshot()
   assert.equal(snapshot.backend.lookups, 2)
   assert.equal(snapshot.backend.downloads, 6)
-  assert.equal(snapshot.backend.errors, 1)
+  assert.equal(snapshot.backend.errors, 0)
   assert.equal(snapshot.backend.rateLimited, 0)
+  assert.equal(snapshot.catalog.signedUrlRefreshes, 1)
+  await diagnostics.flush()
+  assert.equal(await readFile(diagnostics.filePath, 'utf8'), '')
+  metrics.stop()
+  assert.equal(metricsHaveCacheErrors(metrics.snapshot()), false)
   await object.dispose()
+})
+
+test('a signed URL refresh that also gets 403 remains a cache error', async t => {
+  const payload = Buffer.from('payload behind repeatedly denied URLs')
+  const objectDigest = digest(payload)
+  const built = buildPack([{kind: 'cas', digest: objectDigest, payload}])
+  const key = packKey(built, 61)
+  const {catalog} = catalogFor([
+    {
+      key,
+      size: built.bytes.byteLength,
+      createdAt: '2026-07-26T12:00:00.000Z'
+    }
+  ])
+  const staleUrl = 'https://blob.example.test/stale-terminal'
+  const freshUrl = 'https://blob.example.test/fresh-terminal'
+  const entry = findPackIndexEntry(built.entries, 'cas', objectDigest)
+  assert.ok(entry)
+  const payloadRange = packPayloadRange(entry)
+  let lookup = 0
+  const backend = new FakeBackend(
+    async () => ({
+      kind: 'hit',
+      downloadUrl: lookup++ === 0 ? staleUrl : freshUrl
+    }),
+    async (url, offset, length) => {
+      if (
+        offset === Number(payloadRange.offset) &&
+        length === Number(payloadRange.length)
+      ) {
+        throw new BackendError(`signed URL denied: ${url}`, {
+          statusCode: 403,
+          retryable: false
+        })
+      }
+      return rangeResponse(built.bytes, offset, length)
+    }
+  )
+  const metrics = new Metrics(true, false)
+  const directory = await temporaryDirectory(t)
+  const diagnostics = new DiagnosticJournal(
+    path.join(directory, 'errors.ndjson')
+  )
+  const reader = new PackReader({
+    backend,
+    catalog,
+    metrics,
+    diagnostics,
+    directory,
+    maxObjectSize: 1024
+  })
+
+  assert.equal(await reader.materialize('cas', objectDigest), undefined)
+  assert.equal(backend.lookupCalls.length, 2)
+  const snapshot = metrics.snapshot()
+  assert.equal(snapshot.backend.downloads, 6)
+  assert.equal(snapshot.backend.errors, 1)
+  assert.equal(snapshot.catalog.signedUrlRefreshes, 1)
+  await diagnostics.flush()
+  const events = (await readFile(diagnostics.filePath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.area, 'pack-reader')
+  assert.equal(events[0]?.operation, 'candidate')
+  assert.equal(events[0]?.statusCode, 403)
+  metrics.stop()
+  assert.equal(metricsHaveCacheErrors(metrics.snapshot()), true)
+})
+
+test('cold readers share one refresh after an expired index URL', async t => {
+  const payload = Buffer.from('payload behind an initially expired index URL')
+  const objectDigest = digest(payload)
+  const built = buildPack([{kind: 'cas', digest: objectDigest, payload}])
+  const key = packKey(built, 611)
+  const {catalog} = catalogFor([
+    {
+      key,
+      size: built.bytes.byteLength,
+      createdAt: '2026-07-26T12:00:00.000Z'
+    }
+  ])
+  const staleUrl = 'https://blob.example.test/stale-index'
+  const freshUrl = 'https://blob.example.test/fresh-index'
+  const parallelReaders = 6
+  let lookup = 0
+  let staleRangeStarted!: () => void
+  let releaseStaleRange!: () => void
+  const staleStarted = new Promise<void>(resolve => {
+    staleRangeStarted = resolve
+  })
+  const staleGate = new Promise<void>(resolve => {
+    releaseStaleRange = resolve
+  })
+  const sharedExpiration = new BackendError('index URL expired', {
+    statusCode: 403,
+    retryable: false
+  })
+  const backend = new FakeBackend(
+    async () => ({
+      kind: 'hit',
+      downloadUrl: lookup++ === 0 ? staleUrl : freshUrl
+    }),
+    async (url, offset, length) => {
+      if (url === staleUrl) {
+        staleRangeStarted()
+        await staleGate
+        throw sharedExpiration
+      }
+      return rangeResponse(built.bytes, offset, length)
+    }
+  )
+  const metrics = new Metrics(true, false)
+  const directory = await temporaryDirectory(t)
+  const diagnostics = new DiagnosticJournal(
+    path.join(directory, 'errors.ndjson')
+  )
+  const reader = new PackReader({
+    backend,
+    catalog,
+    metrics,
+    diagnostics,
+    directory,
+    maxObjectSize: 1024
+  })
+
+  const reads = Array.from({length: parallelReaders}, () =>
+    reader.materialize('cas', objectDigest)
+  )
+  await staleStarted
+  const flights = (
+    reader as unknown as {
+      indexFlights: Map<string, {waiters: number}>
+    }
+  ).indexFlights
+  await waitUntil(() => flights.get(key)?.waiters === parallelReaders)
+  releaseStaleRange()
+  const objects = await Promise.all(reads)
+  for (const object of objects) {
+    assert.ok(object)
+    assert.deepEqual(await readFile(object.path), payload)
+    await object.dispose()
+  }
+
+  assert.equal(backend.lookupCalls.length, 2)
+  const snapshot = metrics.snapshot()
+  assert.equal(snapshot.backend.downloads, parallelReaders + 3)
+  assert.equal(snapshot.backend.errors, 0)
+  assert.equal(snapshot.catalog.signedUrlRefreshes, 1)
+  await diagnostics.flush()
+  assert.equal(await readFile(diagnostics.filePath, 'utf8'), '')
+})
+
+test('parallel readers share one refresh of an expired cached URL', async t => {
+  const payload = Buffer.from('parallel payload behind an expired URL')
+  const objectDigest = digest(payload)
+  const built = buildPack([{kind: 'cas', digest: objectDigest, payload}])
+  const key = packKey(built, 62)
+  const {catalog} = catalogFor([
+    {
+      key,
+      size: built.bytes.byteLength,
+      createdAt: '2026-07-26T12:00:00.000Z'
+    }
+  ])
+  const staleUrl = 'https://blob.example.test/stale-parallel'
+  const freshUrl = 'https://blob.example.test/fresh-parallel'
+  const entry = findPackIndexEntry(built.entries, 'cas', objectDigest)
+  assert.ok(entry)
+  const payloadRange = packPayloadRange(entry)
+  const parallelReaders = 8
+  let lookup = 0
+  let expired = false
+  let staleRequests = 0
+  let releaseStaleRequests!: () => void
+  let allStaleRequestsStarted!: () => void
+  const staleGate = new Promise<void>(resolve => {
+    releaseStaleRequests = resolve
+  })
+  const allStarted = new Promise<void>(resolve => {
+    allStaleRequestsStarted = resolve
+  })
+  const backend = new FakeBackend(
+    async () => ({
+      kind: 'hit',
+      downloadUrl: lookup++ === 0 ? staleUrl : freshUrl
+    }),
+    async (url, offset, length) => {
+      if (
+        expired &&
+        url === staleUrl &&
+        offset === Number(payloadRange.offset) &&
+        length === Number(payloadRange.length)
+      ) {
+        staleRequests += 1
+        if (staleRequests === parallelReaders) allStaleRequestsStarted()
+        await staleGate
+        throw new BackendError('cached signed URL expired', {
+          statusCode: 403,
+          retryable: false
+        })
+      }
+      return rangeResponse(built.bytes, offset, length)
+    }
+  )
+  const metrics = new Metrics(true, false)
+  const directory = await temporaryDirectory(t)
+  const diagnostics = new DiagnosticJournal(
+    path.join(directory, 'errors.ndjson')
+  )
+  const reader = new PackReader({
+    backend,
+    catalog,
+    metrics,
+    diagnostics,
+    directory,
+    maxObjectSize: 1024
+  })
+  const warm = await reader.materialize('cas', objectDigest)
+  assert.ok(warm)
+  await warm.dispose()
+  expired = true
+
+  const reads = Array.from({length: parallelReaders}, () =>
+    reader.materialize('cas', objectDigest)
+  )
+  await allStarted
+  releaseStaleRequests()
+  const objects = await Promise.all(reads)
+  for (const object of objects) {
+    assert.ok(object)
+    assert.deepEqual(await readFile(object.path), payload)
+    await object.dispose()
+  }
+
+  assert.equal(backend.lookupCalls.length, 2)
+  const snapshot = metrics.snapshot()
+  assert.equal(snapshot.backend.downloads, 21)
+  assert.equal(snapshot.backend.errors, 0)
+  assert.equal(snapshot.catalog.signedUrlRefreshes, 1)
+  await diagnostics.flush()
+  assert.equal(await readFile(diagnostics.filePath, 'utf8'), '')
 })
 
 test('download 429 and catalog REST 403 propagate Retry-After and operation metrics', async t => {

@@ -100,7 +100,7 @@ test('ActionsCacheBackend sends exact Twirp JSON paths, authentication, and prot
     assert.equal(headers.get('accept'), 'application/json')
     assert.equal(headers.get('authorization'), 'Bearer runtime-token')
     assert.equal(headers.get('content-type'), 'application/json')
-    assert.equal(headers.get('user-agent'), 'bazel-gha-remote-cache/0.0.5')
+    assert.equal(headers.get('user-agent'), 'bazel-gha-remote-cache/0.0.6')
     assert.ok(call.init?.signal instanceof AbortSignal)
   }
 })

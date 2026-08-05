@@ -101,6 +101,7 @@ function waitWithAbort<T>(
 export class PackReader {
   private readonly indexCache = new Map<string, CachedPack>()
   private readonly indexFlights = new Map<string, IndexFlight>()
+  private readonly deferredAuthenticationFailures = new WeakSet<BackendError>()
   private readonly indexCacheSize: number
   private lastCatalogMetrics: PackCatalogMetrics
 
@@ -141,6 +142,8 @@ export class PackReader {
           )
           if (materialized !== undefined) return materialized
         } catch (error) {
+          const deferredAuthenticationFailure =
+            this.isDeferredAuthenticationFailure(error)
           if (error instanceof BackendError && error.rateLimited) {
             throw error
           }
@@ -160,7 +163,10 @@ export class PackReader {
             },
             error
           )
-          if (!(error instanceof BackendError)) {
+          if (
+            deferredAuthenticationFailure ||
+            !(error instanceof BackendError)
+          ) {
             this.options.metrics.backend('errors')
           }
         }
@@ -193,11 +199,10 @@ export class PackReader {
   ): Promise<MaterializedPackObject | undefined> {
     let cached
     try {
-      cached = await this.loadPack(candidate, false, signal)
+      cached = await this.loadPack(candidate, signal)
     } catch (error) {
-      if (!this.isAuthenticationFailure(error)) throw error
-      this.indexCache.delete(candidate.key)
-      cached = await this.loadPack(candidate, true, signal)
+      if (!this.isDeferredAuthenticationFailure(error)) throw error
+      cached = await this.loadPack(candidate, signal, true)
     }
     if (cached === undefined) return undefined
     const entry = findPackIndexEntry(cached.entries, kind, digest)
@@ -209,9 +214,11 @@ export class PackReader {
     try {
       return await this.downloadEntry(cached, entry, signal)
     } catch (error) {
-      if (this.isAuthenticationFailure(error)) {
-        this.indexCache.delete(candidate.key)
-        cached = await this.loadPack(candidate, true, signal)
+      if (this.isDeferredAuthenticationFailure(error)) {
+        if (this.indexCache.get(candidate.key) === cached) {
+          this.indexCache.delete(candidate.key)
+        }
+        cached = await this.loadPack(candidate, signal, true)
         if (cached === undefined) return undefined
         const refreshedEntry = findPackIndexEntry(cached.entries, kind, digest)
         if (refreshedEntry === undefined) return undefined
@@ -223,22 +230,19 @@ export class PackReader {
 
   private async loadPack(
     candidate: PackCatalogEntry<ParsedPackCacheKey>,
-    force: boolean,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    signedUrlRefresh = false
   ): Promise<CachedPack | undefined> {
-    if (force) {
+    const existing = this.indexCache.get(candidate.key)
+    if (existing !== undefined) {
       this.indexCache.delete(candidate.key)
-    } else {
-      const existing = this.indexCache.get(candidate.key)
-      if (existing !== undefined) {
-        this.indexCache.delete(candidate.key)
-        this.indexCache.set(candidate.key, existing)
-        return existing
-      }
+      this.indexCache.set(candidate.key, existing)
+      return existing
     }
 
     let flight = this.indexFlights.get(candidate.key)
     if (flight === undefined) {
+      if (signedUrlRefresh) this.options.metrics.signedUrlRefresh()
       const controller = new AbortController()
       const promise = this.loadPackUncached(candidate, controller.signal)
       flight = {promise, controller, waiters: 0, settled: false}
@@ -316,10 +320,20 @@ export class PackReader {
     if (this.indexFlights.get(key) === flight) this.indexFlights.delete(key)
   }
 
-  private isAuthenticationFailure(error: unknown): boolean {
+  private isRefreshableAuthenticationFailure(
+    error: unknown
+  ): error is BackendError {
     return (
       error instanceof BackendError &&
+      !error.rateLimited &&
       (error.statusCode === 401 || error.statusCode === 403)
+    )
+  }
+
+  private isDeferredAuthenticationFailure(error: unknown): boolean {
+    return (
+      error instanceof BackendError &&
+      this.deferredAuthenticationFailures.has(error)
     )
   }
 
@@ -329,9 +343,7 @@ export class PackReader {
     length: number,
     signal?: AbortSignal
   ): Promise<Uint8Array> {
-    const response = await this.observedBackend(
-      'downloads',
-      'download',
+    const response = await this.observedRangeDownload(
       () =>
         this.options.backend.openDownloadRange(
           signedUrl,
@@ -368,9 +380,7 @@ export class PackReader {
     let bytes = 0
     try {
       if (length > 0) {
-        const response = await this.observedBackend(
-          'downloads',
-          'download',
+        const response = await this.observedRangeDownload(
           () =>
             this.options.backend.openDownloadRange(
               pack.downloadUrl,
@@ -481,6 +491,32 @@ export class PackReader {
       if (error instanceof BackendError && error.rateLimited) {
         this.options.metrics.backend('rateLimited')
         this.options.metrics.rateLimit(operation)
+      }
+      throw error
+    }
+  }
+
+  private async observedRangeDownload<T>(
+    call: () => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    this.options.metrics.backend('downloads')
+    try {
+      return await call()
+    } catch (error) {
+      if (isSuppressibleAbortError(error, signal)) throw error
+      if (this.isRefreshableAuthenticationFailure(error)) {
+        this.deferredAuthenticationFailures.add(error)
+        throw error
+      }
+      this.options.metrics.backend('errors')
+      this.options.diagnostics?.record(
+        {area: 'backend', operation: 'download'},
+        error
+      )
+      if (error instanceof BackendError && error.rateLimited) {
+        this.options.metrics.backend('rateLimited')
+        this.options.metrics.rateLimit('download')
       }
       throw error
     }

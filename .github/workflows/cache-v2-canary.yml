@@ -369,7 +369,7 @@ jobs:
 
           jq -e '
             .schemaVersion == 1 and
-            (.metrics.schemaVersion == 3) and
+            (.metrics.schemaVersion == 4) and
             (.metrics.integrityFailures >= 1) and
             any(
               .errors[]?;

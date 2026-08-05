@@ -244,6 +244,7 @@ async function addSummary(stats: MetricsSnapshot): Promise<void> {
         {data: 'Value', header: true}
       ],
       ['Catalog refreshes', String(stats.catalog.refreshes)],
+      ['Signed URL refreshes', String(stats.catalog.signedUrlRefreshes)],
       ['Bloom candidates', String(stats.catalog.bloomCandidates)],
       ['Bloom false positives', String(stats.catalog.bloomFalsePositives)],
       ['Range bytes downloaded', String(stats.catalog.rangeBytesDownloaded)],

@@ -169,7 +169,7 @@ test('diagnostics document admits only validated metrics and sanitized daemon me
   })
 
   assert.equal(document.schemaVersion, 1)
-  assert.equal(document.actionVersion, '0.0.5')
+  assert.equal(document.actionVersion, '0.0.6')
   assert.equal(document.metrics?.integrityFailures, 1)
   assert.deepEqual(document.metrics?.writeBack.remainingObjectIds, [])
   assert.equal(document.errors.length, 1)

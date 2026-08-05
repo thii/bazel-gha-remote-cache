@@ -63,7 +63,7 @@ export interface KindCounters {
 }
 
 export interface MetricsSnapshot {
-  schemaVersion: 3
+  schemaVersion: 4
   startedAt: string
   stoppedAt?: string
   readable: boolean
@@ -112,6 +112,7 @@ export interface MetricsSnapshot {
   }
   catalog: {
     refreshes: number
+    signedUrlRefreshes: number
     bloomCandidates: number
     bloomFalsePositives: number
     rangeBytesDownloaded: number
